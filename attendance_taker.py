@@ -7,7 +7,24 @@ import time
 import logging
 import sqlite3
 import datetime
+import firebase_admin
+from firebase_admin import credentials, db
+import datetime
+import pytz
 
+
+
+# ----------------------------
+# Initialize Firebase
+# ----------------------------
+cred_path = os.path.join(os.path.dirname(__file__), "serviceAccountKey.json")
+cred = credentials.Certificate(cred_path)
+
+# Kiểm tra nếu Firebase chưa được initialize
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': 'https://face-detect-60c0e-default-rtdb.firebaseio.com/'  # Thay bằng URL Realtime Database của bạn
+    })
 
 # Dlib  / Use frontal face detector of Dlib
 detector = dlib.get_frontal_face_detector()
@@ -18,20 +35,13 @@ predictor = dlib.shape_predictor('data/data_dlib/shape_predictor_68_face_landmar
 # Dlib Resnet Use Dlib resnet50 model to get 128D face descriptor
 face_reco_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recognition_resnet_model_v1.dat")
 
-# Create a connection to the database
-conn = sqlite3.connect("attendance.db")
-cursor = conn.cursor()
+
 
 # Create a table for the current date
 current_date = datetime.datetime.now().strftime("%Y_%m_%d")  # Replace hyphens with underscores
 table_name = "attendance" 
 create_table_sql = f"CREATE TABLE IF NOT EXISTS {table_name} (name TEXT, time TEXT, date DATE, UNIQUE(name, date))"
-cursor.execute(create_table_sql)
 
-
-# Commit changes and close the connection
-conn.commit()
-conn.close()
 
 
 class Face_Recognizer:
@@ -157,23 +167,20 @@ class Face_Recognizer:
                                  cv2.LINE_AA)
     # insert data in database
 
+    
     def attendance(self, name):
-        current_date = datetime.datetime.now().strftime('%Y-%m-%d')
-        conn = sqlite3.connect("attendance.db")
-        cursor = conn.cursor()
-        # Check if the name already has an entry for the current date
-        cursor.execute("SELECT * FROM attendance WHERE name = ? AND date = ?", (name, current_date))
-        existing_entry = cursor.fetchone()
+       current_date = datetime.datetime.now().strftime('%Y-%m-%d')
+       current_time = datetime.datetime.now().strftime('%H:%M:%S')
+ 
+       ref = db.reference('attendance')
+    # Luôn push record mới, kể cả khi đã nhận diện trước đó
+       ref.push({
+        'name': name,
+        'date': current_date,
+        'time': current_time
+       })
 
-        if existing_entry:
-            print(f"{name} is already marked as present for {current_date}")
-        else:
-            current_time = datetime.datetime.now().strftime('%H:%M:%S')
-            cursor.execute("INSERT INTO attendance (name, time, date) VALUES (?, ?, ?)", (name, current_time, current_date))
-            conn.commit()
-            print(f"{name} marked as present for {current_date} at {current_time}")
-
-        conn.close()
+       print(f"{name} updated at {current_time} on {current_date}")
 
     #  Face detection and recognition wit OT from input video stream
     def process(self, stream):
@@ -337,3 +344,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
