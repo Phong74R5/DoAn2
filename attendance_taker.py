@@ -5,12 +5,11 @@ import os
 import pandas as pd
 import time
 import logging
-import sqlite3
 import datetime
 import firebase_admin
 from firebase_admin import credentials, db
 import datetime
-import pytz
+
 
 
 
@@ -40,7 +39,6 @@ face_reco_model = dlib.face_recognition_model_v1("data/data_dlib/dlib_face_recog
 # Create a table for the current date
 current_date = datetime.datetime.now().strftime("%Y_%m_%d")  # Replace hyphens with underscores
 table_name = "attendance" 
-create_table_sql = f"CREATE TABLE IF NOT EXISTS {table_name} (name TEXT, time TEXT, date DATE, UNIQUE(name, date))"
 
 
 
