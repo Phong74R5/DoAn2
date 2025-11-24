@@ -124,8 +124,10 @@ Giao diện web hiển thị dữ liệu dưới dạng bảng.
 ---
 
 ## 🖼️ Giao diện minh họa
-![Ảnh minh họa](image/Screenshot 2025-11-24 153921.png)
 
+<p align="center">
+<img src="image/Screenshot 2025-11-24 153921.png" alt="Giao diện hệ thống" width="800"/>
+</p>
 
 ---
 
