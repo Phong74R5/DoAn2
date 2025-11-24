@@ -6,26 +6,29 @@ void queue_init(FrameQueue* q) {
     pthread_cond_init(&q->cond_not_empty, NULL);
 }
 
-void queue_push(FrameQueue* q, Mat frame) {
+void queue_push(FrameQueue* q, cv::Mat frame) {
     pthread_mutex_lock(&q->mutex);
     if (q->count == QUEUE_SIZE) {
-        q->tail = (q->tail + 1) % QUEUE_SIZE;
+//	printf("Warning: Queue full, dropping oldest frame!\n");
+        q->head = (q->tail + 1) % QUEUE_SIZE;
         q->count--;
     }
-    q->frames[q->head] = frame;
-    q->head = (q->head + 1) % QUEUE_SIZE;
+    q->frames[q->tail] = frame;
+    q->tail = (q->tail + 1) % QUEUE_SIZE;
     q->count++;
     pthread_cond_signal(&q->cond_not_empty);
     pthread_mutex_unlock(&q->mutex);
 }
 
-void queue_pop(FrameQueue* q, Mat* frame_out) {
+void queue_pop(FrameQueue* q, cv::Mat* frame_out) {
     pthread_mutex_lock(&q->mutex);
+    //ch? n?u queue r?ng
     while (q->count == 0) {
         pthread_cond_wait(&q->cond_not_empty, &q->mutex);
     }
-    *frame_out = q->frames[q->tail];
-    q->tail = (q->tail + 1) % QUEUE_SIZE;
+    *frame_out = q->frames[q->head];
+    //C?p nh?t head
+    q->head = (q->head + 1) % QUEUE_SIZE;
     q->count--;
     pthread_mutex_unlock(&q->mutex);
 }

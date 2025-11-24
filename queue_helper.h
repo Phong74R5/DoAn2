@@ -5,10 +5,9 @@
 #include <pthread.h>
 #include "config.h"
 
-using namespace cv;
 
 typedef struct {
-    Mat frames[QUEUE_SIZE];
+    cv::Mat frames[QUEUE_SIZE];
     int head;
     int tail;
     int count;
@@ -18,11 +17,11 @@ typedef struct {
 
 // Khai báo hàm
 void queue_init(FrameQueue* q);
-void queue_push(FrameQueue* q, Mat frame);
-void queue_pop(FrameQueue* q, Mat* frame_out);
+void queue_push(FrameQueue* q, cv::Mat frame);
+void queue_pop(FrameQueue* q, cv::Mat* frame_out);
 
 // Khai báo biến toàn cục (extern) để các file khác cùng thấy
-extern FrameQueue q_raw;
+//extern FrameQueue q_raw;
 extern FrameQueue q_display;
 
 #endif

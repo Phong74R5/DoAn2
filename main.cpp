@@ -6,7 +6,7 @@
 #include "tasks.h"
 
 // Định nghĩa thực tế cho các biến extern
-FrameQueue q_raw;
+//FrameQueue q_raw;
 FrameQueue q_display;
 
 int main() {
@@ -30,7 +30,7 @@ int main() {
     lcd_init_full();
     
     // 2. Init Queues
-    queue_init(&q_raw);
+//    queue_init(&q_raw);
     queue_init(&q_display);
 
     // 3. Create Tasks
