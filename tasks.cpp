@@ -44,16 +44,22 @@ void* task_camera(void* arg) {
         printf("[Task Cam] Error: Cannot open camera! Check connection.\n");
         return NULL;
     }
-    
+    cv::Mat cam_frame;
     cv::Mat frame;
+	
     printf("[Task Cam] Started successfully\n");
     
-    while(1) {
-        cap >> frame;
+    while(1) { 
+       cap >> cam_frame;
+	cv::resize(cam_frame, frame, cv::Size(LCD_WIDTH, LCD_HEIGHT));
         if (frame.empty()) {
             usleep(10000);
             continue;
         }
+        std::cout << "type=" << frame.type()
+          << " channels=" << frame.channels()
+          << " size=" << frame.cols << "x" << frame.rows
+          << std::endl;
 
         // 1. Đẩy vào hàng đợi hiển thị (Queue Display)
         // Clone() là bắt buộc để tránh xung đột vùng nhớ
@@ -154,7 +160,7 @@ void* task_ai_demo(void* arg) {
                 float dist = faceNet.calculateDistance(current_embedding, owner_embedding);
                 
                 // Ngưỡng (Threshold): 0.4 - 0.5 thường dùng cho Cosine Distance
-                if (dist < 0.45) {
+                if (dist < 1) {
                     local_result.message = "ACCESS GRANTED";
                     local_result.color = cv::Scalar(0, 255, 0); // Xanh lá
                 } else {
