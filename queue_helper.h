@@ -1,7 +1,7 @@
 #ifndef QUEUE_HELPER_H
 #define QUEUE_HELPER_H
 
-#include <opencv2/opencv.hpp>
+#include <opencv4/opencv2/opencv.hpp>
 #include <pthread.h>
 #include "config.h"
 

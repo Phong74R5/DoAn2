@@ -38,7 +38,7 @@ int main() {
     printf("Starting tasks...\n");
     
     pthread_create(&t_cam, NULL, task_camera, NULL);
-    pthread_create(&t_ai,  NULL, task_ai_demo, NULL);
+    pthread_create(&t_ai,  NULL, task_ai_improved, NULL);
     pthread_create(&t_lcd, NULL, task_lcd,    NULL);
     
     // 4. Loop
