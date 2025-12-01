@@ -6,7 +6,7 @@
 #include "tasks.h"
 
 // Định nghĩa thực tế cho các biến extern
-FrameQueue q_raw;
+//FrameQueue q_raw;
 FrameQueue q_display;
 
 int main() {
@@ -30,7 +30,7 @@ int main() {
     lcd_init_full();
     
     // 2. Init Queues
-    queue_init(&q_raw);
+//    queue_init(&q_raw);
     queue_init(&q_display);
 
     // 3. Create Tasks
@@ -38,7 +38,7 @@ int main() {
     printf("Starting tasks...\n");
     
     pthread_create(&t_cam, NULL, task_camera, NULL);
-    pthread_create(&t_ai,  NULL, task_ai_demo, NULL);
+    pthread_create(&t_ai,  NULL, task_ai_improved, NULL);
     pthread_create(&t_lcd, NULL, task_lcd,    NULL);
     
     // 4. Loop
