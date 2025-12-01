@@ -1,4 +1,7 @@
 #include "queue_helper.h"
+#include <stdio.h>
+
+// --- IMPLEMENT FRAME QUEUE (CŨ) ---
 
 void queue_init(FrameQueue* q) {
     q->head = 0; q->tail = 0; q->count = 0;
@@ -8,27 +11,35 @@ void queue_init(FrameQueue* q) {
 
 void queue_push(FrameQueue* q, cv::Mat frame) {
     pthread_mutex_lock(&q->mutex);
+    
+    // Nếu full thì ghi đè frame cũ nhất (Circular Buffer)
     if (q->count == QUEUE_SIZE) {
-//	printf("Warning: Queue full, dropping oldest frame!\n");
+        // printf("Warning: Queue full, dropping oldest frame!\n");
         q->head = (q->tail + 1) % QUEUE_SIZE;
         q->count--;
     }
+    
     q->frames[q->tail] = frame;
     q->tail = (q->tail + 1) % QUEUE_SIZE;
     q->count++;
+    
     pthread_cond_signal(&q->cond_not_empty);
     pthread_mutex_unlock(&q->mutex);
 }
 
 void queue_pop(FrameQueue* q, cv::Mat* frame_out) {
     pthread_mutex_lock(&q->mutex);
-    //ch? n?u queue r?ng
+    
+    // Chờ nếu queue rỗng
     while (q->count == 0) {
         pthread_cond_wait(&q->cond_not_empty, &q->mutex);
     }
+    
     *frame_out = q->frames[q->head];
-    //C?p nh?t head
+    
+    // Cập nhật head
     q->head = (q->head + 1) % QUEUE_SIZE;
     q->count--;
+    
     pthread_mutex_unlock(&q->mutex);
 }

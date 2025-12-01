@@ -6,71 +6,66 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <cmath>
 
 class FaceNet {
 private:
     cv::dnn::Net net;
-    bool is_loaded = false; // Cờ đánh dấu
+    bool is_loaded = false;
 
 public:
     FaceNet() {}
 
-    void loadModel(const std::string& modelPath) {
+    bool loadModel(const std::string& modelPath) {
         try {
             net = cv::dnn::readNetFromONNX(modelPath);
-            
             if (net.empty()) {
-                std::cerr << "[FaceNet] Model loaded but EMPTY!" << std::endl;
+                std::cerr << "[FaceNet] ERROR: Model is empty!" << std::endl;
                 is_loaded = false;
-                return;
+                return false;
             }
-
+            // Ưu tiên chạy CPU trên Raspberry Pi (OpenCV backend)
             net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
             net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
             
             is_loaded = true;
-            std::cout << "[FaceNet] Model loaded successfully: " << modelPath << std::endl;
+            std::cout << "[FaceNet] Model loaded: " << modelPath << std::endl;
+            return true;
         } catch (const cv::Exception& e) {
-            std::cerr << "[FaceNet] Error loading model: " << e.what() << std::endl;
+            std::cerr << "[FaceNet] Exception: " << e.what() << std::endl;
             is_loaded = false;
+            return false;
         }
     }
 
     cv::Mat getEmbedding(const cv::Mat& face_img) {
-        // --- FIX CRASH: Kiểm tra model trước khi chạy ---
-        if (!is_loaded || net.empty()) {
-            // Trả về ma trận rỗng nếu chưa load model
-            return cv::Mat(); 
-        }
-
-        if (face_img.empty()) return cv::Mat();
+        if (!is_loaded || face_img.empty()) return cv::Mat();
 
         cv::Mat blob;
-        // MobileFaceNet chuẩn dùng size 112x112
+        // Chuẩn hóa input cho MobileFaceNet: 112x112, scale 1/127.5, mean 127.5
         cv::dnn::blobFromImage(face_img, blob, 
-                               1.0 / 128.0,             
-                               cv::Size(112, 112),      
+                               1.0 / 127.5,        
+                               cv::Size(112, 112), 
                                cv::Scalar(127.5, 127.5, 127.5), 
-                               true,                    
-                               false);                  
+                               true, false);
 
         net.setInput(blob);
-        return net.forward().clone();
+        cv::Mat output = net.forward();
+
+        // --- CỰC KỲ QUAN TRỌNG: L2 NORMALIZE ---
+        // Vector phải có độ dài = 1 để so sánh chính xác bằng Cosine
+        cv::Mat outputNorm;
+        cv::normalize(output, outputNorm); 
+        
+        return outputNorm.clone();
     }
 
-    float calculateDistance(const cv::Mat& v1, const cv::Mat& v2) {
-        // Nếu vector rỗng (do lỗi model), trả về khoảng cách lớn nhất (khác nhau)
-        if (v1.empty() || v2.empty()) return 10.0f; 
-
-        double dot = v1.dot(v2);
-        double norm1 = cv::norm(v1);
-        double norm2 = cv::norm(v2);
-        
-        // Tránh chia cho 0
-        if (norm1 == 0 || norm2 == 0) return 10.0f;
-
-        double similarity = dot / (norm1 * norm2);
-        return 1.0f - (float)similarity;
+    // Tính độ tương đồng (Cosine Similarity)
+    // Giá trị từ -1 đến 1. Càng gần 1 càng giống nhau.
+    float calculateSimilarity(const cv::Mat& v1, const cv::Mat& v2) {
+        if (v1.empty() || v2.empty()) return -1.0f;
+        // Vì đã Normalize, tích vô hướng chính là Cosine Similarity
+        return (float)v1.dot(v2);
     }
 };
 
