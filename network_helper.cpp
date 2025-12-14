@@ -9,7 +9,7 @@
 using json = nlohmann::json;
 
 // ================= CONFIG =================
-const std::string FIREBASE_HOST = "https://YOUR_PROJECT_ID.firebaseio.com"; 
+const std::string FIREBASE_HOST = "https://facedetect-7c1fe-default-rtdb.firebaseio.com"; 
 const float MATCH_THRESHOLD = 0.60f; // Độ chính xác > 60% là nhận
 
 // ================= DATA STORE =================
@@ -183,7 +183,7 @@ bool Network_FindMatch(const cv::Mat& current_embedding, FaceNet& faceNet,
         cv::Mat userEmb(1, g_users[i].embedding.size(), CV_32F, g_users[i].embedding.data());
         
         // Tính similarity (Cosine Distance)
-        float score = faceNet.calculateSimilarity(current_embedding, userEmb);
+        float score = faceNet.cosineSimilarity(current_embedding, userEmb);
         
         if (score > maxScore) {
             maxScore = score;

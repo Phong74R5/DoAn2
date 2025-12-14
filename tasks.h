@@ -1,19 +1,30 @@
 #ifndef TASKS_H
 #define TASKS_H
-extern std::atomic<bool> g_running;
-// Task Camera: Đọc ảnh từ Camera & đẩy vào Queue
+
+#include <opencv2/opencv.hpp>
+
+// ==========================================
+// Task Function Declarations
+// ==========================================
+
+// Task 1: Camera capture
 void* task_camera(void* arg);
 
-// Task AI: Xử lý nhận diện & Điều phối logic (Đổi tên từ task_ai_demo)
-void* task_ai(void* arg);
-
-// Task LCD: Hiển thị hình ảnh lên màn hình
-void* task_lcd(void* arg);
-
-// [NEW] Task Button: Xử lý ngắt/polling nút bấm vật lý (GPIO)
+// Task 2: Register button
 void* task_button(void* arg);
 
-// [NEW] Task Network: Xử lý các request HTTP (Firebase) nặng nề
+// Task 2.5: Sleep/Wake button
+void* task_sleep_button(void* arg);
+
+// Task 3: Network communication
 void* task_network(void* arg);
 
-#endif
+// Task 4: AI processing
+void* task_ai(void* arg);
+
+// Task 5: LCD display
+void* task_lcd(void* arg);
+
+#define QUEUE_SIZE 2
+
+#endif // TASKS_H

@@ -23,7 +23,7 @@ typedef struct {
 // Hàm cho FrameQueue (Code nằm bên .cpp)
 void queue_init(FrameQueue* q);
 void queue_push(FrameQueue* q, cv::Mat frame);
-void queue_pop(FrameQueue* q, cv::Mat* frame_out);
+bool queue_pop(FrameQueue* q, cv::Mat* frame_out); // Đã sửa thành bool
 
 // Biến toàn cục cho FrameQueue
 extern FrameQueue q_display;
@@ -31,7 +31,6 @@ extern FrameQueue q_display;
 // ==========================================
 // PHẦN 2: SAFE QUEUE (C++ Template) - Dùng cho Network
 // ==========================================
-// LƯU Ý: Template phải viết toàn bộ trong file .h
 
 template <typename T>
 class SafeQueue {
@@ -39,6 +38,8 @@ private:
     std::queue<T> q;
     std::mutex mtx;
     std::condition_variable cv;
+    bool running = true; // Thêm cờ để báo hiệu dừng queue
+
 public:
     // Đẩy vào
     void push(T value) {
@@ -47,12 +48,28 @@ public:
         cv.notify_one();
     }
 
-    // Lấy ra
-    void pop(T* value) {
+    // Lấy ra (Sửa từ void -> bool)
+    bool pop(T* value) {
         std::unique_lock<std::mutex> lock(mtx);
-        cv.wait(lock, [this]{ return !q.empty(); });
+        
+        // Chờ dữ liệu HOẶC tín hiệu dừng (running = false)
+        cv.wait(lock, [this]{ return !q.empty() || !running; });
+        
+        // Nếu queue rỗng và đã có lệnh dừng -> trả về false
+        if (q.empty() && !running) {
+            return false;
+        }
+
         *value = q.front();
         q.pop();
+        return true; // Lấy thành công
+    }
+    
+    // Hàm để dừng queue khi tắt app
+    void stop() {
+        std::lock_guard<std::mutex> lock(mtx);
+        running = false;
+        cv.notify_all();
     }
     
     bool empty() {
@@ -62,15 +79,16 @@ public:
 };
 
 // --- Wrapper functions ---
-// Các hàm này giúp code cũ (queue_push(&q, val)) chạy được với SafeQueue mới
+// Sửa wrapper trả về bool để khớp với logic trong tasks.cpp
+
 template <typename T>
 void queue_push(SafeQueue<T>* sq, T val) {
     sq->push(val);
 }
 
 template <typename T>
-void queue_pop(SafeQueue<T>* sq, T* val) {
-    sq->pop(val);
+bool queue_pop(SafeQueue<T>* sq, T* val) {
+    return sq->pop(val);
 }
 
 #endif
