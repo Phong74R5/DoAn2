@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Face Recognition Attendance System</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔐 Face Recognition Attendance System</h1>
+            <p class="subtitle">Raspberry Pi 4 - Real-time Monitoring Dashboard</p>
+            <p class="author">Made by Tran Gia Huy & Le Hong Phong</p>
+        </header>
+
+        <div class="tabs">
+            <button class="tab active" onclick="showTab('attendance')">📊 Attendance Records</button>
+            <button class="tab" onclick="showTab('users')">👥 Registered Users</button>
+        </div>
+
+        <!-- Attendance Tab -->
+        <div id="attendance" class="content active">
+            <div class="stats">
+                <div class="stat-card">
+                    <div class="stat-label">Total Check-ins Today</div>
+                    <div class="stat-value" id="todayCount">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Total Attendance Records</div>
+                    <div class="stat-value" id="totalAttendance">0</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2 style="margin-bottom: 20px; color: #667eea;">📋 Recent Attendance</h2>
+                <div class="search-box">
+                    <input type="text" id="searchAttendance" placeholder="🔍 Search by name or date..." onkeyup="filterAttendance()">
+                </div>
+                <div class="table-container">
+                    <table id="attendanceTable">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Date</th>
+                                <th>Time</th>
+                                <th>ID</th>
+                            </tr>
+                        </thead>
+                        <tbody id="attendanceBody">
+                            <tr>
+                                <td colspan="4" class="loading">Loading attendance data...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Users Tab -->
+        <div id="users" class="content">
+            <div class="stats">
+                <div class="stat-card">
+                    <div class="stat-label">Total Registered Users</div>
+                    <div class="stat-value" id="totalUsers">0</div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2 style="margin-bottom: 20px; color: #667eea;">👤 User Management</h2>
+                <div class="search-box">
+                    <input type="text" id="searchUsers" placeholder="🔍 Search users..." onkeyup="filterUsers()">
+                </div>
+                <div class="table-container">
+                    <table id="usersTable">
+                        <thead>
+                            <tr>
+                                <th>User ID</th>
+                                <th>Name</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="usersBody">
+                            <tr>
+                                <td colspan="3" class="loading">Loading users data...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Edit Modal -->
+    <div id="editModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">✏️ Edit User Name</div>
+            <div class="form-group">
+                <label for="editName">New Name:</label>
+                <input type="text" id="editName" placeholder="Enter new name">
+            </div>
+            <div class="modal-actions">
+                <button class="btn-secondary" onclick="closeModal()">Cancel</button>
+                <button class="btn-primary" onclick="saveEdit()">Save Changes</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+    
+    <!-- Custom Scripts -->
+    <script src="firebase-config.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

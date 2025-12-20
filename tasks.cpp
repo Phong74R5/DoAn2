@@ -146,6 +146,7 @@ void* task_camera(void* arg) {
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, LCD_HEIGHT);
     cap.set(cv::CAP_PROP_FPS, 30);
 
+
     if (!cap.isOpened()) {
         printf("[Task Cam] Error: Cannot open camera!\n");
         return NULL;
@@ -511,6 +512,8 @@ void* task_ai(void* arg) {
             std::lock_guard<std::mutex> lock(mtx_ai);
             shared_result = local_result;
         }
+        
+        usleep(5000);
     }
     return NULL;
 }
