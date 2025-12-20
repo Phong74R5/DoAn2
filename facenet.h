@@ -127,16 +127,16 @@ public:
     FaceNet() {}
 
     // ---------------------------
-    // Load Model
+    // Load Model (Đã sửa return bool)
     // ---------------------------
-    void loadModel(const std::string& modelPath) {
+    bool loadModel(const std::string& modelPath) {
         try {
             net = cv::dnn::readNetFromONNX(modelPath);
 
             if (net.empty()) {
                 std::cerr << "[FaceNet] Model loaded but EMPTY\n";
                 is_loaded = false;
-                return;
+                return false; // Thất bại
             }
 
             net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
@@ -144,10 +144,12 @@ public:
 
             is_loaded = true;
             std::cout << "[FaceNet] Model loaded: " << modelPath << std::endl;
+            return true; // Thành công
 
         } catch (const cv::Exception& e) {
             std::cerr << "[FaceNet] Error: " << e.what() << std::endl;
             is_loaded = false;
+            return false; // Thất bại (Exception)
         }
     }
 
@@ -166,11 +168,11 @@ public:
         // Tạo blob (CHÚ Ý: swapRB = false vì đã convert RGB ở trên)
         cv::Mat blob = cv::dnn::blobFromImage(
             processed,
-            1.0,              // scale = 1.0 vì đã normalize rồi
+            1.0,                      // scale = 1.0 vì đã normalize rồi
             cv::Size(112, 112),
             cv::Scalar(0, 0, 0), // mean = 0 vì đã trừ 127.5
-            false,            // swapRB = false (đã RGB)
-            false             // crop
+            false,                    // swapRB = false (đã RGB)
+            false                     // crop
         );
 
         net.setInput(blob);
@@ -272,7 +274,7 @@ public:
     bool verifyFace(const cv::Mat& test_embedding, 
                     const cv::Mat& reference_embedding,
                     float& similarity,
-                    float threshold = 0.9f) {  // Cosine Similarity >= 0.90
+                    float threshold = 0.60f) {  // GIẢM THRESHOLD CHO PHÙ HỢP HƠN
         
         similarity = cosineSimilarity(test_embedding, reference_embedding);
         

@@ -1,158 +1,214 @@
-# Dự án: Camera hiển thị lên màn hình SPI LCD (Multi-threading C++)
+# Face Recognition System (Raspberry Pi)
 
-Dự án này sử dụng **Raspberry Pi** để đọc dữ liệu từ **USB Webcam**, xử lý ảnh bằng **OpenCV** và hiển thị **thời gian thực** lên màn hình **TFT LCD 2.4 inch (Driver ILI9341)** qua giao tiếp **SPI**.
+## 1. Scope
 
-Chương trình được thiết kế theo mô hình **Multi-threading (Đa luồng)** giúp tách biệt:
-- Luồng đọc Camera
-- Luồng xử lý / AI Demo
-- Luồng hiển thị LCD
+This repository contains an embedded face recognition application intended to run on Raspberry Pi platforms as an **edge device**. The software is designed for direct hardware access and deterministic runtime behavior.
 
-→ Nhờ đó tận dụng tốt tài nguyên CPU và đạt hiệu suất cao hơn.
+The system is not a desktop application and does not rely on the Linux framebuffer or windowing system.
 
 ---
 
-## 1. Yêu cầu phần cứng
+## 2. Target Platform
 
-- **Mạch xử lý**: Raspberry Pi 3 Model B/B+ hoặc Raspberry Pi 4  
-- **Hệ điều hành**: Raspberry Pi OS (Legacy hoặc bản mới)  
-- **Màn hình**: TFT LCD 2.4" hoặc 2.8"  
-  - Giao tiếp SPI  
-  - Driver ILI9341  
-- **Camera**: USB Webcam bất kỳ (Logitech, Genius, v.v.)
+* SoC: Broadcom BCM2835 / BCM2836 / BCM2711
+* Board: Raspberry Pi 3B / 3B+ / Raspberry Pi 4
+* OS: Linux (Raspberry Pi OS / Yocto-based rootfs)
+* CPU Architecture: ARMv7 / ARMv8
 
 ---
 
-## 2. Sơ đồ nối dây (Wiring Diagram)
+## 3. Hardware Interfaces
 
-> ⚠ **Lưu ý quan trọng:**  
-> Sơ đồ sử dụng chuẩn chân **BCM (Broadcom)** của Raspberry Pi.  
-> Hãy nối chính xác từng chân để tránh lỗi **màn hình trắng**.
+### 3.1 Display Interface
 
-| Chân LCD (ILI9341) | Chân Raspberry Pi (Vật lý) | BCM GPIO | Chức năng                             |
-|--------------------|---------------------------|----------|---------------------------------------|
-| VCC                | Pin 1 (3.3V)             | -        | Nguồn 3.3V                            |
-| GND                | Pin 6                    | -        | Mass (GND)                            |
-| CS                 | Pin 24                   | GPIO 8   | Chip Select (CE0)                     |
-| RESET              | Pin 18                   | GPIO 24  | Khởi động lại màn hình               |
-| DC / RS            | Pin 22                   | GPIO 25  | Data / Command Select                 |
-| SDI / MOSI         | Pin 19                   | GPIO 10  | Truyền dữ liệu (Master Out)          |
-| SCK / CLK          | Pin 23                   | GPIO 11  | Xung nhịp (Clock)                    |
-| LED                | Pin 16                   | GPIO 23  | Đèn nền (Backlight) – **BẮT BUỘC**   |             |
+* Type: SPI TFT LCD
+* Controller: ILI9341
+* Resolution: 320x240
+* Color format: RGB565
+* Driver: Custom SPI driver using BCM2835 library
 
-> 💡 Nếu bạn **đổi chân nối**, hãy cập nhật lại trong file `config.h`.
+The display is driven directly over SPI. Linux framebuffer and DRM/KMS are not used.
+
+### 3.2 Camera Interface
+
+* Type: USB UVC camera
+* Resolution: 320x240 (configurable)
+* Capture: OpenCV VideoCapture
+
+### 3.3 GPIO
+
+* Library: BCM2835
+* Numbering: Physical pin numbering (RPI_V2_GPIO_P1_xx)
+* Inputs:
+
+  * Register button
+  * Sleep button
+* Internal pull-up resistors enabled in software
 
 ---
 
-## 3. Cài đặt thư viện (Software Setup)
+## 4. System Flow Chart
 
-Mở **Terminal** trên Raspberry Pi và chạy lần lượt các bước sau.
+```mermaid
+flowchart TD
+    START([Power On]) --> INIT[System Init]
+    INIT --> HW[Init GPIO / SPI / LCD]
+    HW --> CAM[Start Camera Thread]
+    HW --> AI[Start AI Thread]
+    HW --> NET[Start Network Thread]
+    HW --> LCD[Start LCD Thread]
 
-### Bước 1: Cập nhật hệ thống
+    CAM -->|Frame| Q1[Frame Queue]
+    Q1 --> AI
+    AI -->|Result| Q2[Result Queue]
+    Q2 --> LCD
 
-```bash
-sudo apt-get update
-sudo apt-get install build-essential cmake pkg-config -y
+    AI -->|User ID| NET
+    NET -->|Sync DB| AI
+
+    BTN[Register Button] --> AI
+    BTN2[Sleep Button] --> LCD
+
+    LCD --> LOOP{Running?}
+    LOOP -->|Yes| CAM
+    LOOP -->|No| STOP([Shutdown])
 ```
 
-### Bước 2: Cài đặt thư viện OpenCV (C++ Development)
+---
 
-Thư viện này cần để **đọc camera** và **xử lý ma trận ảnh**.
+## 5. Software Architecture
 
-```bash
-sudo apt-get install libopencv-dev -y
+The application is implemented as a multi-threaded process with strict separation of responsibilities.
+
+* Camera thread
+
+  * Captures frames from USB camera
+  * Pushes frames into shared queue
+
+* AI thread
+
+  * Performs face detection
+  * Runs MobileFaceNet (ONNX) for embedding extraction
+  * Computes cosine similarity for identity matching
+
+* LCD thread
+
+  * Converts BGR888 to RGB565
+  * Sends frame buffer over SPI to ILI9341
+
+* Network thread
+
+  * Synchronizes user database with Firebase
+  * Uploads recognition / attendance events
+  * Runs asynchronously to avoid blocking real-time tasks
+
+Thread synchronization is handled using mutexes, condition variables, and bounded queues.
+
+---
+
+## 6. Data Flow Diagram
+
+```mermaid
+sequenceDiagram
+    participant Camera
+    participant AI
+    participant LCD
+    participant Network
+
+    Camera->>AI: Video Frame
+    AI->>AI: Face Detection
+    AI->>AI: Face Embedding
+    AI->>Network: User ID / Event
+    Network-->>AI: Updated User DB
+    AI->>LCD: Frame + Bounding Boxes + Name
+    LCD-->>Camera: Ready for Next Frame
 ```
 
-### Bước 3: Cài đặt thư viện BCM2835 (Driver SPI tốc độ cao)
+---
 
-Thư viện này giúp điều khiển **GPIO** và **SPI low-level** với tốc độ cao.
+## 7. AI Model
+
+* Model: MobileFaceNet
+* Format: ONNX
+* Inference backend: OpenCV DNN
+* Output: 128-D face embedding vector
+
+---
+
+## 8. Thread Interaction Diagram
+
+```
++-------------+      +-------------+      +-------------+
+| Camera      | ---> | AI Thread   | ---> | LCD Thread  |
++-------------+      +-------------+      +-------------+
+       |                    |
+       |                    v
+       |             +-------------+
+       |             | Network     |
+       |             | Thread      |
+       |             +-------------+
+       |
+       v
++-------------+
+| Button ISR  |
++-------------+
+```
+
+---
+
+## 9. Build System
+
+* Build type: Native build
+* Language: C++17
+* Build tool: Make
+
+### 6.1 Dependencies
+
+* OpenCV (C++ development headers)
+* BCM2835 library
+* libcurl (network communication)
+
+### 6.2 Build
 
 ```bash
-# 1. Tải về
-wget http://www.airspayce.com/mikem/bcm2835/bcm2835-1.73.tar.gz
-
-# 2. Giải nén
-tar zxvf bcm2835-1.73.tar.gz
-
-# 3. Vào thư mục và biên dịch
-cd bcm2835-1.73
-./configure
 make
-sudo make check
-sudo make install
-
-# 4. Quay lại thư mục trước
-cd ..
-```
-
-### Bước 4: Bật giao tiếp SPI trên Raspberry Pi
-
-```bash
-sudo raspi-config
-```
-
-- Chọn: `Interface Options` → `SPI` → `Yes`  
-- Sau đó khởi động lại:
-
-```bash
-sudo reboot
 ```
 
 ---
 
-## 4. Biên dịch và chạy chương trình
+## 7. Runtime
 
-### Biên dịch (Build)
-
-Trong thư mục project, chạy:
+The application requires root privileges for direct SPI and GPIO access.
 
 ```bash
-make
-```
-
-Sau khi biên dịch thành công, sẽ tạo ra file thực thi:
-
-```text
-app_camera
-```
-
-### Chạy (Run)
-
-```bash
-make run
-```
-
-### Dọn dẹp (Clean)
-
-Xóa file biên dịch cũ:
-
-```bash
-make clean
+sudo ./app_camera
 ```
 
 ---
 
-## 5. Khắc phục sự cố (Troubleshooting)
+## 8. Deployment Notes
 
-| Hiện tượng                                | Nguyên nhân                                 | Cách khắc phục                                                                 |
-|-------------------------------------------|---------------------------------------------|---------------------------------------------------------------------------------|
-| `bcm2835_init failed`                     | Chạy chương trình không có quyền root       | Thêm `sudo` trước lệnh chạy: `sudo ./app_camera`                               |
-| `opencv2/opencv.hpp: No such file`       | Chưa cài thư viện OpenCV Dev                | Cài lại OpenCV ở **Bước 2**                                                    |
-| Màn hình trắng xóa                        | Sai dây nối hoặc chưa `RESET` đúng          | Kiểm tra lại dây `DC` (Pin 22) và `RESET` (Pin 18)                             |
-| Màn hình tối đen                          | Đèn nền chưa bật                             | Kiểm tra dây `LED` nối Pin 16 (GPIO 23), code đã bật chân này lên `HIGH`       |
-| Hình ảnh bị ngược / lật gương            | Sai cấu hình hướng quét (Scan Direction)    | Mở `lcd_driver.cpp`, trong hàm `lcd_init_full`, tìm lệnh gửi `0x36`; thử đổi giá trị: `0x28`, `0xE8`, `0x48` hoặc `0x88` |
-| Hình ảnh bị sai màu (Đỏ thành xanh, v.v.) | Sai định dạng màu (BGR <-> RGB)             | Trong `tasks.cpp` đã có đoạn chuyển đổi sang RGB565; nếu vẫn sai kiểm tra lại công thức chuyển đổi |
+* Suitable for headless operation
+* Intended for kiosk or dedicated appliance usage
+* Can be integrated into system startup via systemd service
+* Compatible with Yocto-based images if BCM2835 and OpenCV are included
 
 ---
 
-## 6. Cấu trúc thư mục dự án
+## 9. Limitations
 
-```text
-.
-├── main.cpp          # File chính, khởi tạo phần cứng và tạo các luồng (threads)
-├── tasks.cpp         # Logic 3 tác vụ: Camera, AI Demo, LCD Display
-├── lcd_driver.cpp    # Driver SPI low-level cho màn hình ILI9341
-├── queue_helper.cpp  # Hàng đợi chia sẻ dữ liệu giữa các luồng (thread-safe)
-├── config.h          # Cấu hình GPIO, độ phân giải màn hình, tham số hệ thống
-├── Makefile          # Script build nhanh bằng lệnh `make`
-└── README.md         # Tài liệu mô tả dự án (file này)
-```
+* Single-camera support
+* SPI bandwidth limits LCD refresh rate
+* Performance depends on Raspberry Pi model
+
+---
+
+## 10. Author
+
+* Le Hong Phong
+* Tran Gia Huy
+---
+
+## 11. License
+
+Internal / embedded use only. Redistribution requires author approval.
