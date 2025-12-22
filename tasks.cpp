@@ -3,9 +3,13 @@
 #include <vector>
 #include <string>
 #include <mutex>
-#include <condition_variable>
 #include <atomic>
 #include <bcm2835.h>
+#include <cmath>
+#include <cstdarg> // Để xử lý tham số log
+#include <ctime>   // Để lấy thời gian thực
+#include <opencv2/opencv.hpp>
+#include <opencv2/dnn.hpp>
 
 #include "tasks.h"
 #include "config.h"
@@ -14,584 +18,480 @@
 #include "facenet.h"
 #include "network_helper.h"
 
-// ==========================================
-// SHARED DATA STRUCTURES
-// ==========================================
+// =============================================================
+// GLOBAL VARIABLES & SHARED DATA
+// =============================================================
+std::atomic<bool> g_register_mode(false);
+std::atomic<bool> g_is_sleeping(false);
+std::vector<UserInfo> g_ram_users;
 
 struct AIResult {
     std::vector<cv::Rect> faces;
     std::string message;
+    std::string sub_message; // Hiển thị phụ (VD: Độ chính xác %)
     cv::Scalar color;
     bool has_detection;
 };
 
-struct DetectionFilter {
-    std::vector<float> recent_similarities;
-    const int WINDOW_SIZE = 7;
-    
-    bool isStable(float new_similarity) {
-        recent_similarities.push_back(new_similarity);
-        if (recent_similarities.size() > (size_t)WINDOW_SIZE) {
-            recent_similarities.erase(recent_similarities.begin());
-        }
-        
-        if (recent_similarities.size() < 5) return false;
-        
-        float mean = 0;
-        for (float s : recent_similarities) mean += s;
-        mean /= recent_similarities.size();
-        
-        float variance = 0;
-        for (float s : recent_similarities) {
-            variance += (s - mean) * (s - mean);
-        }
-        variance /= recent_similarities.size();
-        float stddev = sqrt(variance);
-        
-        return stddev < 0.05f;
-    }
-    
-    float getAverage() {
-        if (recent_similarities.empty()) return 0.0f;
-        float sum = 0;
-        for (float s : recent_similarities) sum += s;
-        return sum / recent_similarities.size();
-    }
-    
-    void clear() {
-        recent_similarities.clear();
-    }
-};
-
-// ==========================================
-// GLOBAL VARIABLES
-// ==========================================
-
-// AI Processing
-std::mutex mtx_ai;
-std::condition_variable cv_ai;
+extern std::mutex mtx_users;
+extern std::mutex mtx_ai;
 cv::Mat shared_ai_frame;
 bool new_frame_for_ai = false;
 AIResult shared_result;
 
-// FaceNet
-FaceNet faceNet;
-DetectionFilter detection_filter;
+// =============================================================
+// HELPER FUNCTIONS (LOGGING & UI)
+// =============================================================
 
-// Network Mode
-SafeQueue<NetworkJob> q_network;
-std::atomic<bool> g_is_register_requested(false);
+// Hàm ghi log có thời gian thực: [HH:MM:SS] [TAG] Message
+void Log(const char* tag, const char* fmt, ...) {
+    time_t now = time(0);
+    struct tm tstruct;
+    char time_buf[80];
+    tstruct = *localtime(&now);
+    strftime(time_buf, sizeof(time_buf), "%H:%M:%S", &tstruct);
 
-// Sleep Mode
-std::atomic<bool> g_is_sleeping(false);
-std::mutex mtx_sleep;
-
-// Trigger load user
-std::atomic<bool> g_is_loading_users(false);
-
-
-// ==========================================
-// HELPER FUNCTIONS
-// ==========================================
-
-bool isFaceAligned(const cv::Rect& face, const cv::Mat& frame) {
-    float aspect_ratio = (float)face.width / face.height;
-    if (aspect_ratio < 0.75f || aspect_ratio > 1.25f) return false;
+    printf("[%s] [%s] ", time_buf, tag);
     
-    int margin = 30;
-    if (face.x < margin || face.y < margin ||
-        face.x + face.width > frame.cols - margin ||
-        face.y + face.height > frame.rows - margin) {
-        return false;
-    }
-    
-    if (face.width < 80 || face.height < 80) return false;
-    
-    return true;
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    printf("\n");
 }
 
-cv::Rect selectBestFace(const std::vector<cv::Rect>& faces, 
-                         const cv::Mat& frame,
-                         FaceNet& faceNet) {
-    if (faces.empty()) return cv::Rect();
-    
-    float best_score = -1.0f;
-    cv::Rect best_face;
-    
-    for (const auto& face : faces) {
-        if (!isFaceAligned(face, frame)) continue;
-        
-        cv::Mat face_roi = frame(face);
-        float quality = faceNet.checkQuality(face_roi);
-        float size_score = std::min(1.0f, (face.width * face.height) / 12000.0f);
-        
-        float total_score = quality * 0.8f + size_score * 0.2f;
-        
-        if (total_score > best_score) {
-            best_score = total_score;
-            best_face = face;
+// Vẽ thanh ngang trong suốt (Hiệu ứng kính)
+void draw_transparent_bar(cv::Mat& img, int y, int height, cv::Scalar color, double alpha) {
+    if (y + height > img.rows) height = img.rows - y;
+    cv::Mat roi = img(cv::Rect(0, y, img.cols, height));
+    cv::Mat color_layer(roi.size(), CV_8UC3, color);
+    cv::addWeighted(color_layer, alpha, roi, 1.0 - alpha, 0.0, roi);
+}
+
+// Vẽ khung bao quanh mặt chỉ với 4 góc (Corner Bracket)
+void draw_corner_rect(cv::Mat& img, cv::Rect r, cv::Scalar color, int length, int thickness) {
+    // Góc trên trái
+    cv::line(img, cv::Point(r.x, r.y), cv::Point(r.x + length, r.y), color, thickness);
+    cv::line(img, cv::Point(r.x, r.y), cv::Point(r.x, r.y + length), color, thickness);
+    // Góc trên phải
+    cv::line(img, cv::Point(r.x + r.width, r.y), cv::Point(r.x + r.width - length, r.y), color, thickness);
+    cv::line(img, cv::Point(r.x + r.width, r.y), cv::Point(r.x + r.width, r.y + length), color, thickness);
+    // Góc dưới trái
+    cv::line(img, cv::Point(r.x, r.y + r.height), cv::Point(r.x + length, r.y + r.height), color, thickness);
+    cv::line(img, cv::Point(r.x, r.y + r.height), cv::Point(r.x, r.y + r.height - length), color, thickness);
+    // Góc dưới phải
+    cv::line(img, cv::Point(r.x + r.width, r.y + r.height), cv::Point(r.x + r.width - length, r.y + r.height), color, thickness);
+    cv::line(img, cv::Point(r.x + r.width, r.y + r.height), cv::Point(r.x + r.width, r.y + r.height - length), color, thickness);
+}
+
+// =============================================================
+// TASK IMPLEMENTATIONS
+// =============================================================
+
+void* task_btn_register(void* arg) {
+    bcm2835_gpio_fsel(PIN_BTN_REG, BCM2835_GPIO_FSEL_INPT);
+    bcm2835_gpio_set_pud(PIN_BTN_REG, BCM2835_GPIO_PUD_UP);
+    printf("[BTN] Init Register Button Pin %d\n", PIN_BTN_REG);
+
+    while (g_running) {
+        if (bcm2835_gpio_lev(PIN_BTN_REG) == LOW) {
+            bcm2835_delay(50);
+
+            if (bcm2835_gpio_lev(PIN_BTN_REG) == LOW) {
+                g_register_mode = !g_register_mode;
+                printf("[BTN] Mode Changed: %s\n", g_register_mode ? "REGISTER" : "SCAN");
+
+                while (bcm2835_gpio_lev(PIN_BTN_REG) == LOW && g_running) {
+                    bcm2835_delay(50);
+                }
+                bcm2835_delay(50);
+            }
         }
+        bcm2835_delay(50);
     }
-    
-    return best_face;
+    return NULL;
 }
 
-// ==========================================
-// TASK 1: CAMERA
-// ==========================================
+void* task_btn_power(void* arg) {
+    bcm2835_gpio_fsel(PIN_BTN_SLEEP, BCM2835_GPIO_FSEL_INPT);
+    bcm2835_gpio_set_pud(PIN_BTN_SLEEP, BCM2835_GPIO_PUD_UP);
+    Log("BTN", "Init Power Button Pin %d", PIN_BTN_SLEEP);
+    
+    while (g_running) {
+        if (bcm2835_gpio_lev(PIN_BTN_SLEEP) == LOW) {
+            int hold_time = 0;
+            while (bcm2835_gpio_lev(PIN_BTN_SLEEP) == LOW && hold_time < 3000) {
+                bcm2835_delay(100);
+                hold_time += 100;
+            }
+
+            if (hold_time >= 3000) {
+                {
+                    std::lock_guard<std::mutex> lock(mtx_ai);
+                    shared_result.message = "SHUTTING DOWN...";
+                    shared_result.color = cv::Scalar(0,0,255);
+                }
+                Log("PWR", "Shutdown triggered!");
+                bcm2835_delay(1000); 
+                system("sudo poweroff");
+                g_running = false; 
+            } 
+            else if (hold_time > 50) {
+                g_is_sleeping = !g_is_sleeping;
+                Log("PWR", "Sleep Mode: %s", g_is_sleeping ? "ON" : "OFF");
+                if (g_is_sleeping) bcm2835_gpio_write(PIN_LED, LOW);
+                else bcm2835_gpio_write(PIN_LED, HIGH);
+            }
+            bcm2835_delay(300); 
+        }
+        bcm2835_delay(50); 
+    }
+    return NULL;
+}
 
 void* task_camera(void* arg) {
     cv::VideoCapture cap(0, cv::CAP_V4L2);
     cap.set(cv::CAP_PROP_FRAME_WIDTH, LCD_WIDTH);
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, LCD_HEIGHT);
     cap.set(cv::CAP_PROP_FPS, 30);
-
-
-    if (!cap.isOpened()) {
-        printf("[Task Cam] Error: Cannot open camera!\n");
-        return NULL;
-    }
-
-    cv::Mat cam_frame, frame;
-    printf("[Task Cam] Started successfully\n");
-
+    
+    if(!cap.isOpened()) Log("CAM", "ERR: Cannot open camera!");
+    
+    cv::Mat frame;
     while(g_running) {
-        // Skip khi đang sleep
-        if (g_is_sleeping) {
-            usleep(100000); // Sleep 100ms
-            continue;
-        }
+        if (g_is_sleeping) { usleep(500000); continue; }
 
-        cap >> cam_frame;
-        
-        if (cam_frame.empty()) {
-            usleep(10000);
-            continue;
-        }
+        cap >> frame;
+        if (frame.empty()) continue;
+        cv::resize(frame, frame, cv::Size(LCD_WIDTH, LCD_HEIGHT));
 
-        if (cam_frame.cols != LCD_WIDTH || cam_frame.rows != LCD_HEIGHT) {
-            cv::resize(cam_frame, frame, cv::Size(LCD_WIDTH, LCD_HEIGHT));
-        } else {
-            frame = cam_frame;
-        }
-
-        // Push to display queue
         queue_push(&q_display, frame.clone());
 
-        // Update AI frame
         {
             std::lock_guard<std::mutex> lock(mtx_ai);
             shared_ai_frame = frame.clone();
             new_frame_for_ai = true;
         }
-        cv_ai.notify_one();
-
         usleep(1000);
     }
     return NULL;
 }
 
-// ==========================================
-// TASK 2: BUTTON (BCM2835)
-// ==========================================
-
-void* task_button(void* arg) {
-    // Sửa PIN_BUTTON thành PIN_BTN_REG
-    printf("[Task Button] Init BCM GPIO (REG) ...\n");
-    
-    bcm2835_gpio_fsel(PIN_BTN_REG, BCM2835_GPIO_FSEL_INPT);
-    bcm2835_gpio_set_pud(PIN_BTN_REG, BCM2835_GPIO_PUD_UP); // Kéo lên nguồn (Input thường là 1)
-
-    while(g_running) {
-        if (g_is_sleeping) { bcm2835_delay(100); continue; }
-
-        // Kiểm tra nút bấm (LOW = Đã bấm vì đang nối đất)
-        if (bcm2835_gpio_lev(PIN_BTN_REG) == LOW) {
-            bcm2835_delay(50); // Chống rung (Debounce)
-            
-            if (bcm2835_gpio_lev(PIN_BTN_REG) == LOW) {
-                if (!g_is_register_requested) {
-                    printf("[Button] REGISTER PRESSED!\n");
-                    g_is_register_requested = true;
-                    
-                    // Chờ nhả nút
-                    while (bcm2835_gpio_lev(PIN_BTN_REG) == LOW) {
-                        bcm2835_delay(10);
-                    }
-                }
-            }
-        }
-        bcm2835_delay(20);
-    }
-    return NULL;
-}
-
-// ==========================================
-// TASK 2.5: SLEEP BUTTON (GPIO 18)
-// ==========================================
-
-void* task_sleep_button(void* arg) {
-    printf("[Task Sleep] Init BCM GPIO 18...\n");
-    
-    bcm2835_gpio_fsel(PIN_BTN_SLEEP, BCM2835_GPIO_FSEL_INPT);
-    bcm2835_gpio_set_pud(PIN_BTN_SLEEP, BCM2835_GPIO_PUD_UP);
-
-    while(g_running) {
-        uint8_t value = bcm2835_gpio_lev(PIN_BTN_SLEEP);
-
-        if (value == LOW) {
-            bcm2835_delay(50); // Debounce
-            
-            if (bcm2835_gpio_lev(PIN_BTN_SLEEP) == LOW) {
-                // Toggle sleep mode
-                g_is_sleeping = !g_is_sleeping;
-                
-                if (g_is_sleeping) {
-                    printf("[Sleep] Entering SLEEP mode...\n");
-                    
-                    // Turn off LCD
-                    bcm2835_gpio_write(PIN_LED, LOW);
-//                    lcd_write_cmd(0x28); // Display OFF
-
-                    
-                    printf("[Sleep] LCD OFF | Camera paused | AI paused\n");
-                } else {
-                    printf("[Sleep] WAKING UP...\n");
-                    
-                    // Turn on LCD
-                    bcm2835_gpio_write(PIN_LED, HIGH);
-//                    lcd_write_cmd(0x29); // Display ON
-                    
-                    printf("[Sleep] System resumed!\n");
-                }
-                
-                // Wait for release
-                while (bcm2835_gpio_lev(PIN_BTN_SLEEP) == LOW) {
-                    bcm2835_delay(10);
-                }
-                
-                // Extra delay để tránh double-press
-                bcm2835_delay(300);
-            }
-        }
-        
-        bcm2835_delay(50);
-    }
-    return NULL;
-}
-
-// ==========================================
-// TASK 3: NETWORK
-// ==========================================
-
-void* task_network(void* arg) {
-    printf("[Task Net] Starting...\n");
-    Network_LoadUsers();
-
-    NetworkJob job;
-    while(g_running) {
-        // Check return value
-        if (!queue_pop(&q_network, &job)) {
-            printf("[Task Net] Shutdown signal received\n");
-            break;
-        }
-
-        switch (job.type) {
-            case JOB_LOG_ATTENDANCE:
-                Network_SendLog(job.id, job.name);
-                break;
-            case JOB_REGISTER_USER:
-                Network_RegisterUser(job.embedding);
-                break;
-            case JOB_LOAD_USERS:
-                Network_LoadUsers();
-                g_is_loading_users = false; 
-                break;
-        }
-    }
-    return NULL;
-}
-
-// ==========================================
-// TASK 4: AI PROCESSING (NETWORK MODE)
-// ==========================================
-
 void* task_ai(void* arg) {
-    printf("[Task AI] Loading Models...\n");
+    // 1. Load FaceNet
+    FaceNet faceNet;
+    Log("AI", "Loading FaceNet (MobileFaceNet)...");
+    try { faceNet.loadModel("MobileFaceNet.onnx"); } 
+    catch(...) { Log("AI", "ERR: No FaceNet Model!"); }
     
-    // Load model
-    if (!faceNet.loadModel("MobileFaceNet.onnx")) {
-        printf("[Task AI] CRITICAL: Model load failed!\n");
-        return NULL;
+    // 2. Load YuNet
+    Log("AI", "Loading YuNet...");
+    cv::Ptr<cv::FaceDetectorYN> detector;
+    try {
+        detector = cv::FaceDetectorYN::create(
+            "face_detection_yunet_2023mar.onnx", 
+            "", 
+            cv::Size(LCD_WIDTH, LCD_HEIGHT),
+            0.9f, 0.3f, 5000
+        );
+        Log("AI", "YuNet Loaded OK!");
+    } catch (const cv::Exception& e) {
+        Log("AI", "FATAL: YuNet Error: %s", e.what());
     }
-    
-    // Load cascade
-    cv::CascadeClassifier face_cascade;
-    if(!face_cascade.load("/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml")) {
-        if(!face_cascade.load("haarcascade_frontalface_default.xml")) {
-            printf("[Task AI] Error: Cannot load cascade!\n");
-            return NULL;
-        }
-    }
+
+    g_ram_users = Network_LoadDatabase(); 
+    Log("AI", "Database Loaded: %zu users", g_ram_users.size());
 
     cv::Mat process_frame;
-    printf("[Task AI] ===== NETWORK MODE LOADED =====\n");
-    printf("[Task AI] Using: Cosine Similarity | Stability Filter | Network Database\n\n");
+    std::vector<cv::Mat> reg_samples;
+    int frame_cnt = 0;
 
     while(g_running) {
-        std::unique_lock<std::mutex> lock(mtx_ai);
-        cv_ai.wait(lock, []{ return new_frame_for_ai || !g_running; });
+        if (g_is_sleeping) { usleep(500000); continue; }
 
-        if (!g_running) break;
+        bool has_new = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx_ai);
+            if (new_frame_for_ai) {
+                process_frame = shared_ai_frame.clone();
+                new_frame_for_ai = false;
+                has_new = true;
+            }
+        }
+        if (!has_new) { usleep(10000); continue; }
 
-        // Skip khi đang sleep
-        if (g_is_sleeping) {
-            new_frame_for_ai = false;
-            lock.unlock();
-            usleep(100000);
-            continue;
+        AIResult res;
+        res.has_detection = false;
+        res.color = cv::Scalar(255, 255, 255);
+        res.message = "";
+        res.sub_message = "";
+        frame_cnt++;
+
+        // ----------------------- DETECT -----------------------
+        std::vector<cv::Rect> faces_rect;
+        
+        if (detector) {
+            cv::Mat faces_yunet;
+            detector->setInputSize(process_frame.size());
+            detector->detect(process_frame, faces_yunet);
+
+            for (int i = 0; i < faces_yunet.rows; i++) {
+                float conf = faces_yunet.at<float>(i, 14);
+                if (conf > 0.85f) {
+                    int x = (int)faces_yunet.at<float>(i, 0);
+                    int y = (int)faces_yunet.at<float>(i, 1);
+                    int w = (int)faces_yunet.at<float>(i, 2);
+                    int h = (int)faces_yunet.at<float>(i, 3);
+                    
+                    x = std::max(0, x); y = std::max(0, y);
+                    w = std::min(w, process_frame.cols - x);
+                    h = std::min(h, process_frame.rows - y);
+
+                    if (w > 20 && h > 20) faces_rect.push_back(cv::Rect(x, y, w, h));
+                }
+            }
         }
 
-        process_frame = shared_ai_frame.clone();
-        new_frame_for_ai = false;
-        lock.unlock();
-
-        // AI Processing
-        AIResult local_result;
-        local_result.has_detection = false;
-        local_result.message = "Scanning...";
-        local_result.color = cv::Scalar(0, 255, 255);
-        
-        // Detect faces
-        std::vector<cv::Rect> faces;
-        cv::Mat gray;
-        cv::cvtColor(process_frame, gray, cv::COLOR_BGR2GRAY);
-        
-        face_cascade.detectMultiScale(
-            gray, faces,
-            1.05, 5, 0,
-            cv::Size(60, 60),
-            cv::Size(240, 240)
-        );
-
-        if (!faces.empty()) {
-            cv::Rect best_face = selectBestFace(faces, process_frame, faceNet);
+        if (!faces_rect.empty()) {
+            cv::Rect best = faces_rect[0];
+            for(auto f: faces_rect) if(f.area() > best.area()) best = f;
             
-            if (best_face.area() > 0) {
-                local_result.has_detection = true;
-                local_result.faces.push_back(best_face);
+            res.faces.push_back(best);
+            res.has_detection = true;
+            cv::Mat face_roi = process_frame(best);
+
+            // ----------------------- REGISTER LOGIC -----------------------
+            if (g_register_mode) {
+                res.color = cv::Scalar(255, 0, 0); // Xanh dương (BGR)
                 
-                cv::Mat face_roi = process_frame(best_face);
-                float quality = faceNet.checkQuality(face_roi);
-
-                // === REGISTRATION MODE (Button pressed) ===
-                if (g_is_register_requested) {
-                    g_is_register_requested = false;
-                    
-                    if (quality > 0.50f) {
-                        cv::Mat current_embedding = faceNet.getEmbedding(face_roi);
-                        
-                        if (!current_embedding.empty()) {
-                            local_result.message = "REGISTERING...";
-                            local_result.color = cv::Scalar(255, 165, 0);
-                            
-                            // Update UI immediately
-                            {
-                                std::lock_guard<std::mutex> lk(mtx_ai);
-                                shared_result = local_result;
-                            }
-
-                            // Send to network
-                            NetworkJob job;
-                            job.type = JOB_REGISTER_USER;
-                            job.embedding = current_embedding.clone();
-                            queue_push(&q_network, job);
-                            
-                            printf("[Register] Embedding sent to server (Quality: %.2f)\n", quality);
-                        } else {
-                            local_result.message = "Embedding failed!";
-                            local_result.color = cv::Scalar(0, 0, 255);
-                        }
-                    } else {
-                        local_result.message = "Quality too low!";
-                        local_result.color = cv::Scalar(100, 100, 255);
-                        printf("[Register] Quality too low: %.2f (need >0.50)\n", quality);
-                    }
+                float q = faceNet.checkQuality(face_roi);
+                if (q > 0.1f) { 
+                    reg_samples.push_back(face_roi.clone());
+                    Log("Reg", "Sample added %zu/5 (Q: %.2f)", reg_samples.size(), q);
                 }
-                // === RECOGNITION MODE ===
-                else {
-                    if (quality > 0.45f) {
-                        cv::Mat current_embedding = faceNet.getEmbedding(face_roi);
-                        
-                        if (!current_embedding.empty()) {
-                            // Search in network database
-                            std::string name, id;
-                            float similarity = 0.0f;
-                            bool match = Network_FindMatch(current_embedding, faceNet, name, id, similarity);
 
-                            if (match) {
-                                // Use stability filter like local mode
-                                if (name.empty() && !g_is_loading_users) {
-                                    printf("[Recognition] Name empty → Reloading users from server...\n");
-                            
-                                    NetworkJob reload_job;
-                                    reload_job.type = JOB_LOAD_USERS;
-                                    queue_push(&q_network, reload_job);
-                            
-                                    g_is_loading_users = true;   // khóa lại
-                                }
-                                
-                                
-                                
-                                bool is_stable = detection_filter.isStable(similarity);
-                                float avg_similarity = detection_filter.getAverage();
-                                
-                                const float THRESHOLD = 0.90f; // Cosine similarity threshold
-                                
-                                if (is_stable) {
-                                    if (avg_similarity >= THRESHOLD) {
-                                        std::string disp = name.empty() ? id : name;
-                                        
-                                        local_result.message = "WELCOME " + disp;
-                                        local_result.color = cv::Scalar(0, 255, 0);
-                                        
-                                        printf("[Recognition] ✓ MATCH: %s (Sim: %.3f)\n", 
-                                               disp.c_str(), avg_similarity);
+                res.message = "REGISTERING...";
+                res.sub_message = "Samples: " + std::to_string(reg_samples.size()) + "/5";
+                
+                if (reg_samples.size() >= 5) {
+                    Log("Reg", "Calculating Embedding...");
+                    cv::Mat emb_raw = faceNet.registerOwner(reg_samples);
+                    cv::Mat emb_mean;
 
-                                        // Log attendance
-                                        NetworkJob job;
-                                        job.type = JOB_LOG_ATTENDANCE;
-                                        job.id = id;
-                                        job.name = disp;
-                                        queue_push(&q_network, job);
-                                    } else {
-                                        local_result.message = "ACCESS DENIED";
-                                        local_result.color = cv::Scalar(0, 0, 255);
-                                        printf("[Recognition] ✗ Below threshold (Sim: %.3f)\n", 
-                                               avg_similarity);
-                                    }
-                                } else {
-                                    // Still analyzing
-                                    local_result.message = "Analyzing... " + 
-                                                          std::to_string((int)(similarity*100)) + "%";
-                                    local_result.color = cv::Scalar(255, 200, 0);
-                                }
-                            } else {
-                                // No match in database
-                                local_result.message = "UNKNOWN PERSON";
-                                local_result.color = cv::Scalar(0, 0, 255);
-                                detection_filter.clear();
-                                printf("[Recognition] No match found in database\n");
-                            }
-                        } else {
-                            local_result.message = "Embedding Error";
-                            local_result.color = cv::Scalar(150, 150, 150);
+                    if (emb_raw.rows > 1) cv::reduce(emb_raw, emb_mean, 0, cv::REDUCE_AVG, CV_32F);
+                    else emb_mean = emb_raw;
+
+                    UserInfo u;
+                    u.id = std::to_string(time(nullptr));
+                    u.name = "User_" + u.id.substr(u.id.length()-4);
+                    
+                    u.embedding.clear();
+                    if (emb_mean.isContinuous()) {
+                        for(int i=0; i<emb_mean.cols; i++) u.embedding.push_back(emb_mean.at<float>(0,i));
+                    }
+
+                    if (Network_SaveUser(u)) {
+                        {
+                            std::lock_guard<std::mutex> lock(mtx_users);
+                            g_ram_users.push_back(u);
                         }
+                        res.message = "SUCCESS!";
+                        res.sub_message = "New User: " + u.name;
+                        res.color = cv::Scalar(0, 255, 0);
+                        Log("Reg", "Saved user OK: %s", u.name.c_str());
                     } else {
-                        local_result.message = "Move closer (Q:" + 
-                                              std::to_string((int)(quality*100)) + ")";
-                        local_result.color = cv::Scalar(150, 150, 150);
-                        detection_filter.clear();
+                        res.message = "SAVE FAILED";
+                        res.color = cv::Scalar(0, 0, 255);
+                    }
+                    
+                    reg_samples.clear();
+                    g_register_mode = false;
+                    sleep(2);
+                }
+            } 
+            // ----------------------- RECOGNIZE LOGIC -----------------------
+            else {
+                std::lock_guard<std::mutex> lock(mtx_users);
+                if (g_ram_users.empty()) {
+                    res.message = "DB EMPTY";
+                    res.color = cv::Scalar(0, 255, 255); 
+                } else {
+                    cv::Mat cur_emb = faceNet.getEmbedding(face_roi);
+                    if (!cur_emb.empty()) {
+                        float max_sim = 0;
+                        std::string name = "Unknown";
+                        std::string id = "";
+                        
+                        for(auto& u : g_ram_users) {
+                            if (u.embedding.size() != (size_t)cur_emb.cols) continue;
+                            cv::Mat db_emb(1, u.embedding.size(), CV_32F, u.embedding.data());
+                            
+                            double dot = cur_emb.dot(db_emb);
+                            double n1 = cv::norm(cur_emb);
+                            double n2 = cv::norm(db_emb);
+                            float sim = (n1>0 && n2>0) ? dot/(n1*n2) : 0;
+                            
+                            if (sim > max_sim) { max_sim = sim; name = u.name; id = u.id; }
+                        }
+                        
+                        char sim_str[16];
+                        sprintf(sim_str, "(%.0f%%)", max_sim * 100);
+
+                        if (max_sim > 0.9f) { 
+                            res.message = name;
+                            res.sub_message = std::string("Match ") + sim_str;
+                            res.color = cv::Scalar(0, 255, 0); // Xanh lá
+                            Network_SendLog(id, name);
+                        } else {
+                            res.message = "UNKNOWN";
+                            res.sub_message = std::string("Low ") + sim_str;
+                            res.color = cv::Scalar(0, 0, 255); // Đỏ
+                        }
                     }
                 }
             }
         } else {
-            // No face detected
-            local_result.message = "No Face Detected";
-            local_result.color = cv::Scalar(200, 200, 200);
-            detection_filter.clear();
-            
-            if (g_is_register_requested) {
-                g_is_register_requested = false;
-                printf("[Register] Cancelled - no face detected\n");
-            }
+             // Không phát hiện khuôn mặt
+             res.message = g_register_mode ? "SHOW FACE" : "SCANNING...";
+             res.sub_message = "";
+             frame_cnt = 0;
         }
 
-        // Update result
-        {
-            std::lock_guard<std::mutex> lock(mtx_ai);
-            shared_result = local_result;
-        }
-        
+        { std::lock_guard<std::mutex> lock(mtx_ai); shared_result = res; }
         usleep(5000);
     }
     return NULL;
 }
 
-// ==========================================
-// TASK 5: LCD DISPLAY
-// ==========================================
-
 void* task_lcd(void* arg) {
     uint8_t* spi_buffer = (uint8_t*)malloc(LCD_WIDTH * LCD_HEIGHT * 2);
-    if (!spi_buffer) {
-        printf("[Task LCD] Malloc failed!\n");
-        return NULL;
+    
+    // =========================================================
+    // 1. BOOT SCREEN LOGIC
+    // =========================================================
+    Log("LCD", "Displaying Boot Screen...");
+    
+    // Lưu ý: Cần file "boot_logo.jpg" cùng thư mục với file chạy
+    cv::Mat boot_img = cv::imread("boot_logo.jpg"); 
+    
+    if (boot_img.empty()) {
+        // Fallback: Màn hình đen chữ trắng nếu không có ảnh
+        boot_img = cv::Mat::zeros(LCD_HEIGHT, LCD_WIDTH, CV_8UC3);
+        cv::putText(boot_img, "SYSTEM STARTING...", cv::Point(40, 120), cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255,255,255), 2);
+    } else {
+        cv::resize(boot_img, boot_img, cv::Size(LCD_WIDTH, LCD_HEIGHT));
     }
 
+    // Convert Boot Image RGB -> RGB565 & Send
+    int b_idx = 0;
+    uint8_t* b_p = boot_img.data;
+    for(int i=0; i<LCD_WIDTH*LCD_HEIGHT; i++) {
+        uint8_t b = *b_p++; uint8_t g = *b_p++; uint8_t r = *b_p++;
+        uint16_t c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+        spi_buffer[b_idx++] = c >> 8; spi_buffer[b_idx++] = c & 0xFF;
+    }
+    
+    bcm2835_gpio_write(PIN_DC, LOW);
+    lcd_set_window(0, 0, LCD_WIDTH-1, LCD_HEIGHT-1);
+    bcm2835_gpio_write(PIN_DC, HIGH);
+    bcm2835_spi_transfern((char*)spi_buffer, LCD_WIDTH*LCD_HEIGHT*2);
+    
+    sleep(3); // Giữ màn hình khởi động trong 3 giây
+
+    // =========================================================
+    // 2. MAIN LCD LOOP
+    // =========================================================
     cv::Mat frame;
-    AIResult current_ai_state;
-    printf("[Task LCD] Started\n");
+    AIResult ai_state;
     
     while(g_running) {
-        // Check return value - false = shutdown signal
-        if (!queue_pop(&q_display, &frame)) {
-            printf("[Task LCD] Shutdown signal received\n");
-            break;
-        }
+        if (g_is_sleeping) { usleep(200000); continue; }
         
-        if (frame.cols != LCD_WIDTH || frame.rows != LCD_HEIGHT) {
-            cv::resize(frame, frame, cv::Size(LCD_WIDTH, LCD_HEIGHT));
+        queue_pop(&q_display, &frame); 
+        { std::lock_guard<std::mutex> lock(mtx_ai); ai_state = shared_result; }
+
+        // --- BẮT ĐẦU VẼ GIAO DIỆN (HUD) ---
+        
+        // 1. Vẽ thanh trạng thái trên (Top Bar) - Trong suốt
+        draw_transparent_bar(frame, 0, 35, cv::Scalar(0,0,0), 0.6);
+        
+        // Hiển thị giờ hệ thống
+        time_t now = time(0);
+        struct tm tstruct;
+        char time_buf[10];
+        tstruct = *localtime(&now);
+        strftime(time_buf, sizeof(time_buf), "%H:%M", &tstruct);
+        cv::putText(frame, time_buf, cv::Point(265, 25), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(220,220,220), 1);
+
+        // Hiển thị Mode
+        if (g_register_mode) {
+             cv::putText(frame, "MODE: REGISTER", cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0,0,255), 2);
+             cv::circle(frame, cv::Point(170, 20), 6, cv::Scalar(0,0,255), -1); // Dấu tròn đỏ recording
+        } else {
+             cv::putText(frame, "ACCESS CONTROL", cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0,255,0), 1);
         }
 
-        // Get AI state
-        {
-            std::lock_guard<std::mutex> lock(mtx_ai);
-            current_ai_state = shared_result;
+        // 2. Vẽ thanh trạng thái dưới (Bottom Bar) - Trong suốt
+        draw_transparent_bar(frame, LCD_HEIGHT-45, 45, cv::Scalar(0,0,0), 0.7);
+
+        // 3. Vẽ Face Box & Info
+        if (ai_state.has_detection) {
+             for(auto r : ai_state.faces) {
+                 // Vẽ khung góc cách điệu (Corner Rect) thay vì hình chữ nhật kín
+                 draw_corner_rect(frame, r, ai_state.color, 20, 2);
+             }
+             
+             // Message chính (Tên User) - Font to, rõ
+             cv::putText(frame, ai_state.message, cv::Point(10, LCD_HEIGHT-22), 
+                        cv::FONT_HERSHEY_SIMPLEX, 0.7, ai_state.color, 2);
+             
+             // Message phụ (% Match) - Font nhỏ hơn
+             if (!ai_state.sub_message.empty()) {
+                 cv::putText(frame, ai_state.sub_message, cv::Point(10, LCD_HEIGHT-6), 
+                            cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(200,200,200), 1);
+             }
+        } else {
+             // Trạng thái chờ
+             cv::putText(frame, ai_state.message, cv::Point(10, LCD_HEIGHT-15), 
+                        cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(200,200,200), 1);
         }
 
-        // Draw UI
-        if (current_ai_state.has_detection) {
-            for (size_t i = 0; i < current_ai_state.faces.size(); i++) {
-                cv::rectangle(frame, current_ai_state.faces[i], 
-                             current_ai_state.color, 2);
-            }
+        // 4. Convert OpenCV Mat -> RGB565 Buffer cho LCD
+        int idx = 0;
+        uint8_t* p = frame.data;
+        int total_pixels = LCD_WIDTH * LCD_HEIGHT;
+        
+        for(int i=0; i<total_pixels; i++) {
+            uint8_t b = *p++; 
+            uint8_t g = *p++; 
+            uint8_t r = *p++;
             
-            if (!current_ai_state.faces.empty() && !current_ai_state.message.empty()) {
-                cv::Point p = current_ai_state.faces[0].tl();
-                p.y = (p.y < 20) ? 20 : p.y - 10;
-                cv::putText(frame, current_ai_state.message, p, 
-                           cv::FONT_HERSHEY_SIMPLEX, 0.6, 
-                           current_ai_state.color, 2);
-            }
-        } else if (!current_ai_state.message.empty()) {
-            cv::putText(frame, current_ai_state.message, cv::Point(5, 20), 
-                       cv::FONT_HERSHEY_SIMPLEX, 0.5, 
-                       cv::Scalar(200, 200, 200), 1);
-        }
-
-        // Convert BGR to RGB565 (optimized)
-        uint8_t* pSrc = frame.data;
-        uint8_t* pDst = spi_buffer;
-        int num_pixels = LCD_WIDTH * LCD_HEIGHT;
-        
-        for (int i = 0; i < num_pixels; i++) {
-            uint8_t b = *pSrc++;
-            uint8_t g = *pSrc++;
-            uint8_t r = *pSrc++;
+            // Công thức chuẩn RGB888 to RGB565
+            uint16_t c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
             
-            uint16_t color = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-            *pDst++ = (color >> 8);
-            *pDst++ = (color & 0xFF);
+            spi_buffer[idx++] = (c >> 8); 
+            spi_buffer[idx++] = (c & 0xFF);
         }
         
-        // Send to LCD via SPI
+        // 5. Gửi qua SPI
         bcm2835_gpio_write(PIN_DC, LOW);
-        lcd_set_window(0, 0, LCD_WIDTH-1, LCD_HEIGHT-1); 
+        lcd_set_window(0, 0, LCD_WIDTH-1, LCD_HEIGHT-1);
         bcm2835_gpio_write(PIN_DC, HIGH);
-        bcm2835_spi_transfern((char*)spi_buffer, LCD_WIDTH * LCD_HEIGHT * 2);
+        bcm2835_spi_transfern((char*)spi_buffer, LCD_WIDTH*LCD_HEIGHT*2);
     }
     
     free(spi_buffer);
+    return NULL;
+}
+
+void* task_sync(void* arg) {
+    while (g_running) {
+        for (int i=0; i<10; i++) { if (!g_running) return NULL; sleep(1); }
+        if (g_is_sleeping) continue;
+        {
+            std::lock_guard<std::mutex> lock(mtx_users);
+            if (Network_SyncFromCloud(g_ram_users)) Log("Sync", "Database Updated from Cloud");
+        }
+    }
     return NULL;
 }
