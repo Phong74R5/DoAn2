@@ -1,202 +1,257 @@
 #include "network_helper.h"
 #include <iostream>
+#include <fstream>
 #include <curl/curl.h>
 #include <mutex>
 #include <map>
 #include <ctime>
-#include "json.hpp" // File json.hpp bạn đã tải
+#include <cstring> 
+#include <algorithm>
+#include <sstream> // Cần để convert embedding sang string
+#include "json.hpp" 
 
 using json = nlohmann::json;
 
-// ================= CONFIG =================
+// --- CẤU HÌNH ---
 const std::string FIREBASE_HOST = "https://facedetect-7c1fe-default-rtdb.firebaseio.com"; 
-const float MATCH_THRESHOLD = 0.60f; // Độ chính xác > 60% là nhận
+const std::string LOCAL_DB_FILE = "userdata.dat"; 
+const char ENCRYPTION_KEY = 0xAA; 
 
-// ================= DATA STORE =================
-struct UserInfo {
-    std::string id;
-    std::string name;
-    std::vector<float> embedding;
+struct UserDiskRecord {
+    char id[64];
+    char name[64];
+    float embedding[1024]; 
+    int embedding_size; 
 };
 
-// Biến toàn cục (Chỉ trong file này thấy)
-static std::vector<UserInfo> g_users;
-static std::mutex mtx_users;           // Khóa bảo vệ g_users
-static std::mutex mtx_log;             // Khóa bảo vệ log
-static std::map<std::string, time_t> last_checkin; // Cache thời gian check-in
+static std::mutex mtx_log;
+static std::map<std::string, time_t> last_checkin;
 
-// ================= INTERNAL HELPER =================
+// --- HELPER FUNCTIONS ---
 
-// Lấy thời gian hiện tại
-static void getCurrentDateTime(std::string &dateStr, std::string &timeStr) {
-    time_t now = time(nullptr);
-    tm *ltm = localtime(&now);
-
-    // [FIX] Tăng size lên 40 cho trình biên dịch hết lo lắng
-    char d[40], t[40];
-
-    snprintf(d, sizeof(d), "%04d-%02d-%02d", ltm->tm_year+1900, ltm->tm_mon+1, ltm->tm_mday);
-    snprintf(t, sizeof(t), "%02d:%02d:%02d", ltm->tm_hour, ltm->tm_min, ltm->tm_sec);
-
-    dateStr = d;
-    timeStr = t;
+void xor_crypt(char* data, size_t size) {
+    for (size_t i = 0; i < size; ++i) data[i] ^= ENCRYPTION_KEY;
 }
 
-// Callback hứng data từ Curl
 static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     ((std::string*)userp)->append((char*)contents, size * nmemb);
     return size * nmemb;
 }
 
-// Hàm gửi request tổng quát
-static std::string firebaseRequest(const std::string &endpoint, const std::string &method, const std::string &jsonData = "") {
-    CURL *curl;
-    CURLcode res;
+// Convert vector float sang JSON string mảng: "[0.1, 0.2, ...]"
+std::string EmbeddingToJsonString(const std::vector<float>& emb) {
+    std::stringstream ss;
+    ss << "[";
+    for (size_t i = 0; i < emb.size(); ++i) {
+        ss << emb[i];
+        if (i < emb.size() - 1) ss << ",";
+    }
+    ss << "]";
+    return ss.str();
+}
+
+static std::string firebaseGet(std::string path) {
+    CURL *curl = curl_easy_init();
     std::string readBuffer;
-    std::string url = FIREBASE_HOST + endpoint;
-
-    curl = curl_easy_init();
     if(curl) {
-        struct curl_slist *headers = NULL;
-        headers = curl_slist_append(headers, "Content-Type: application/json");
-
+        std::string url = FIREBASE_HOST + path;
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
-        if (!jsonData.empty()) {
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jsonData.c_str());
-        }
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        // Bỏ qua xác thực SSL để chạy nhanh trên embedded (Production nên bật lại)
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L); // Bỏ qua check SSL
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);       // Timeout 10s
-
-        res = curl_easy_perform(curl);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L); // Timeout 5s
+        
+        CURLcode res = curl_easy_perform(curl);
         if(res != CURLE_OK) {
-            fprintf(stderr, "[Network] Curl Failed: %s\n", curl_easy_strerror(res));
+            printf("[Net] GET Failed: %s\n", curl_easy_strerror(res));
         }
         curl_easy_cleanup(curl);
-        curl_slist_free_all(headers);
     }
     return readBuffer;
 }
 
-// ================= IMPLEMENTATION API =================
+static void firebaseRequest(std::string path, std::string method, std::string data = "") {
+    CURL *curl = curl_easy_init();
+    if(curl) {
+        std::string url = FIREBASE_HOST + path;
+        struct curl_slist *headers = NULL; // Khai báo ngoài để free sau này
 
-void Network_LoadUsers() {
-    printf("[Network] Loading users from Firebase...\n");
-    std::string resp = firebaseRequest("/users.json", "GET");
-
-    if (resp == "null" || resp.empty()) return;
-
-    try {
-        json j = json::parse(resp);
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
         
-        std::lock_guard<std::mutex> lock(mtx_users); // Lock để ghi vào RAM
-        g_users.clear();
+        if (method == "POST") curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        else if (method == "PATCH") curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
+        else if (method == "PUT") curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+        else if (method == "DELETE") curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
 
-        for (auto& element : j.items()) {
-            UserInfo u;
-            u.id = element.key();
-            u.name = element.value().value("name", "Unknown");
-            
-            if (element.value().contains("embedding")) {
-                u.embedding = element.value()["embedding"].get<std::vector<float>>();
-                g_users.push_back(u);
-            }
+        if (!data.empty()) {
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
+            headers = curl_slist_append(headers, "Content-Type: application/json");
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         }
-        printf("[Network] Loaded %zu users success.\n", g_users.size());
-    } catch (std::exception& e) {
-        printf("[Network] JSON Parse Error: %s\n", e.what());
+
+        std::string dummy; // Hứng response để không in ra stdout
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &dummy);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+        
+        CURLcode res = curl_easy_perform(curl);
+        if(res != CURLE_OK) {
+            printf("[Net] %s Failed: %s\n", method.c_str(), curl_easy_strerror(res));
+        }
+
+        // [QUAN TRỌNG] Giải phóng bộ nhớ headers để tránh leak RAM
+        if (headers) curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
     }
 }
 
-void Network_RegisterUser(const cv::Mat& embedding) {
-    // 1. Tạo ID
-    std::string dateStr, timeStr;
-    getCurrentDateTime(dateStr, timeStr);
-    std::string newId = "id_" + dateStr + "_" + timeStr;
-    std::replace(newId.begin(), newId.end(), '-', '_');
-    std::replace(newId.begin(), newId.end(), ':', '_');
+// --- CORE FUNCTIONS ---
 
-    // 2. Convert Mat -> Vector -> JSON
-    std::vector<float> embVec;
-    if (embedding.isContinuous()) {
-        embVec.assign((float*)embedding.datastart, (float*)embedding.dataend);
-    } else {
-        for (int i = 0; i < embedding.cols; ++i) 
-            embVec.push_back(embedding.at<float>(0, i));
+void Network_RewriteStore(const std::vector<UserInfo>& users) {
+    std::ofstream ofs(LOCAL_DB_FILE, std::ios::binary | std::ios::trunc);
+    if (!ofs.is_open()) return;
+
+    for (const auto& u : users) {
+        UserDiskRecord record;
+        memset(&record, 0, sizeof(UserDiskRecord));
+        strncpy(record.id, u.id.c_str(), 63);
+        strncpy(record.name, u.name.c_str(), 63);
+        
+        record.embedding_size = (int)u.embedding.size();
+        if (record.embedding_size > 1024) record.embedding_size = 1024; // Limit check
+        
+        if (record.embedding_size > 0) {
+            std::copy(u.embedding.begin(), u.embedding.begin() + record.embedding_size, record.embedding);
+        }
+
+        xor_crypt((char*)&record, sizeof(UserDiskRecord));
+        ofs.write((char*)&record, sizeof(UserDiskRecord));
     }
+    ofs.close();
+    printf("[Storage] Database rewritten with %zu users.\n", users.size());
+}
 
+std::vector<UserInfo> Network_LoadDatabase() {
+    std::vector<UserInfo> users;
+    std::ifstream ifs(LOCAL_DB_FILE, std::ios::binary);
+    if (!ifs.is_open()) return users;
+    
+    UserDiskRecord record;
+    while (ifs.read((char*)&record, sizeof(UserDiskRecord))) {
+        xor_crypt((char*)&record, sizeof(UserDiskRecord)); 
+        UserInfo u;
+        u.id = std::string(record.id);
+        u.name = std::string(record.name);
+        
+        int size = record.embedding_size;
+        if (size <= 0 || size > 1024) size = 128; // Fallback an toàn
+        
+        u.embedding.assign(record.embedding, record.embedding + size);
+        users.push_back(u);
+    }
+    ifs.close();
+    return users;
+}
+
+bool Network_SaveUser(const UserInfo& u) {
+    // 1. Lưu vào thẻ nhớ (Local)
+    if (u.embedding.size() > 1024) return false; 
+    UserDiskRecord record;
+    memset(&record, 0, sizeof(UserDiskRecord));
+    strncpy(record.id, u.id.c_str(), 63);
+    strncpy(record.name, u.name.c_str(), 63);
+    record.embedding_size = (int)u.embedding.size();
+    std::copy(u.embedding.begin(), u.embedding.end(), record.embedding);
+    
+    xor_crypt((char*)&record, sizeof(UserDiskRecord)); 
+    std::ofstream ofs(LOCAL_DB_FILE, std::ios::binary | std::ios::app);
+    if (!ofs.is_open()) return false;
+    ofs.write((char*)&record, sizeof(UserDiskRecord));
+    ofs.close();
+    
+    // 2. Đẩy lên Firebase (Cloud)
+    // Lưu ý: Đẩy vào node "/users" thay vì tách biệt metadata
     json j;
-    j[newId] = {
-        {"name", ""}, // Tên để trống, cập nhật trên Web sau
-        {"embedding", embVec}
+    j[u.id] = { 
+        {"name", u.name}, 
+        {"created_at", time(nullptr)}
+        // Bỏ comment dòng dưới nếu muốn đẩy cả vector mặt lên cloud (nặng data hơn)
+        // , {"embedding", u.embedding} 
     };
-
-    // 3. Gửi lên
-    printf("[Network] Uploading user: %s\n", newId.c_str());
+    
+    // Dùng PATCH để update node users mà không xóa người khác
+    printf("[Net] Uploading user info for ID: %s\n", u.id.c_str());
     firebaseRequest("/users.json", "PATCH", j.dump());
+    
+    return true;
+}
 
-    // 4. Reload lại list user ngay lập tức để nhận diện được luôn
-    Network_LoadUsers();
+bool Network_SyncFromCloud(std::vector<UserInfo>& local_users) {
+    // [FIX] Đường dẫn phải trùng với nơi SaveUser đẩy lên ("/users.json")
+    std::string jsonStr = firebaseGet("/users.json");
+    
+    if (jsonStr.empty() || jsonStr == "null") return false;
+
+    bool isChanged = false;
+    try {
+        json j = json::parse(jsonStr);
+        std::vector<UserInfo> new_list;
+        
+        // Logic: Duyệt qua danh sách người dùng LOCAL
+        // Nếu Server không có ID đó -> Xóa ở Local (Thu hồi quyền truy cập)
+        // Nếu Server có ID đó nhưng khác Tên -> Đổi tên ở Local
+        
+        for (auto& u : local_users) {
+            if (j.contains(u.id)) {
+                std::string server_name = j[u.id]["name"];
+                if (u.name != server_name) {
+                    printf("[Sync] Rename: %s -> %s\n", u.name.c_str(), server_name.c_str());
+                    u.name = server_name;
+                    isChanged = true;
+                }
+                new_list.push_back(u);
+            } else {
+                // User có ở Local nhưng không có trên Cloud -> Đã bị xóa/Block
+                printf("[Sync] Access Revoked: %s (ID: %s)\n", u.name.c_str(), u.id.c_str());
+                isChanged = true;
+            }
+        }
+
+        if (isChanged) {
+            local_users = new_list;
+            Network_RewriteStore(local_users); // Ghi đè lại file binary local
+        }
+
+    } catch (const std::exception& e) {
+        printf("[Sync] Error parsing JSON: %s\n", e.what());
+    }
+    return isChanged;
 }
 
 void Network_SendLog(const std::string& id, const std::string& name) {
-    // Check spam log (Debounce 30s)
+    // Debounce: Chỉ gửi log mỗi 30 giây cho cùng 1 người
     {
         std::lock_guard<std::mutex> lock(mtx_log);
         time_t now = time(nullptr);
-        if (last_checkin.count(id) && (now - last_checkin[id] < 30)) {
-            return; // Chưa đủ 30s, bỏ qua
-        }
+        if (last_checkin.count(id) && (now - last_checkin[id] < 30)) return;
         last_checkin[id] = now;
     }
 
-    std::string dateStr, timeStr;
-    getCurrentDateTime(dateStr, timeStr);
-
-    json j;
-    j[id] = {
-        {"name", name},
-        {"date", dateStr},
-        {"time", timeStr}
-    };
-
-    // Gửi log
-    firebaseRequest("/attendance.json", "PATCH", j.dump());
-    printf("[Network] Logged: %s at %s\n", name.c_str(), timeStr.c_str());
-}
-
-bool Network_FindMatch(const cv::Mat& current_embedding, FaceNet& faceNet, 
-                       std::string& outName, std::string& outId, float& outScore) {
+    time_t now = time(nullptr);
+    char buf[40];
+    strftime(buf, 40, "%Y-%m-%d %H:%M:%S", localtime(&now));
     
-    std::lock_guard<std::mutex> lock(mtx_users); // Lock để đọc an toàn
-    if (g_users.empty()) return false;
-
-    float maxScore = -1.0f;
-    int bestIdx = -1;
-
-    // Duyệt qua tất cả user trong RAM
-    for (size_t i = 0; i < g_users.size(); ++i) {
-        // Tạo Mat từ vector
-        cv::Mat userEmb(1, g_users[i].embedding.size(), CV_32F, g_users[i].embedding.data());
-        
-        // Tính similarity (Cosine Distance)
-        float score = faceNet.cosineSimilarity(current_embedding, userEmb);
-        
-        if (score > maxScore) {
-            maxScore = score;
-            bestIdx = i;
-        }
-    }
-
-    if (bestIdx != -1 && maxScore > MATCH_THRESHOLD) {
-        outId = g_users[bestIdx].id;
-        outName = g_users[bestIdx].name;
-        outScore = maxScore;
-        return true;
-    }
-
-    return false;
+    json j = { 
+        {"id", id}, 
+        {"name", name}, 
+        {"timestamp", buf},
+        {"timestamp_unix", now} // Thêm timestamp dạng số để dễ sort trên App/Web
+    };
+    
+    printf("[Net] Sending Log: %s\n", name.c_str());
+    firebaseRequest("/attendance.json", "POST", j.dump());
 }
