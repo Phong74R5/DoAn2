@@ -8,7 +8,8 @@
 struct UserInfo {
     std::string id;
     std::string name;
-    std::vector<float> embedding;
+    // THAY ĐỔI: Lưu danh sách các embedding (5 góc) thay vì 1 cái trung bình
+    std::vector<std::vector<float>> embeddings; 
 };
 
 std::vector<UserInfo> Network_LoadDatabase();

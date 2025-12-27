@@ -11,7 +11,7 @@ CFLAGS = -Wall $(shell pkg-config --cflags opencv4)
 LIBS = -lbcm2835 -lpthread -lcurl $(shell pkg-config --libs opencv4)
 
 # Danh sách file nguồn
-SRCS = main.cpp queue_helper.cpp lcd_driver.cpp network_helper.cpp tasks.cpp
+SRCS = main.cpp queue_helper.cpp lcd_driver.cpp network_helper.cpp tasks.cpp wifi_helper.cpp 
 
 # Lệnh build
 all:

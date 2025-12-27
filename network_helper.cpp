@@ -7,7 +7,7 @@
 #include <ctime>
 #include <cstring> 
 #include <algorithm>
-#include <sstream> // Cần để convert embedding sang string
+#include <sstream>
 #include "json.hpp" 
 
 using json = nlohmann::json;
@@ -17,11 +17,14 @@ const std::string FIREBASE_HOST = "https://facedetect-7c1fe-default-rtdb.firebas
 const std::string LOCAL_DB_FILE = "userdata.dat"; 
 const char ENCRYPTION_KEY = 0xAA; 
 
+// Giả định MobileFaceNet output 100 float
+const int EMBEDDING_VECTOR_LEN = 1000; 
+
 struct UserDiskRecord {
     char id[64];
     char name[64];
-    float embedding[1024]; 
-    int embedding_size; 
+    float embedding[5000]; // Đủ chứa 5 vectors * 128 = 640 floats
+    int total_floats;      // Tổng số lượng float đã dùng
 };
 
 static std::mutex mtx_log;
@@ -38,35 +41,20 @@ static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *use
     return size * nmemb;
 }
 
-// Convert vector float sang JSON string mảng: "[0.1, 0.2, ...]"
-std::string EmbeddingToJsonString(const std::vector<float>& emb) {
-    std::stringstream ss;
-    ss << "[";
-    for (size_t i = 0; i < emb.size(); ++i) {
-        ss << emb[i];
-        if (i < emb.size() - 1) ss << ",";
-    }
-    ss << "]";
-    return ss.str();
-}
-
 static std::string firebaseGet(std::string path) {
     CURL *curl = curl_easy_init();
     std::string readBuffer;
     if(curl) {
         std::string url = FIREBASE_HOST + path;
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        // Bỏ qua xác thực SSL để chạy nhanh trên embedded (Production nên bật lại)
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &readBuffer);
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L); // Timeout 5s
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
         
         CURLcode res = curl_easy_perform(curl);
-        if(res != CURLE_OK) {
-            printf("[Net] GET Failed: %s\n", curl_easy_strerror(res));
-        }
+        if(res != CURLE_OK) printf("[Net] GET Failed: %s\n", curl_easy_strerror(res));
         curl_easy_cleanup(curl);
     }
     return readBuffer;
@@ -76,7 +64,7 @@ static void firebaseRequest(std::string path, std::string method, std::string da
     CURL *curl = curl_easy_init();
     if(curl) {
         std::string url = FIREBASE_HOST + path;
-        struct curl_slist *headers = NULL; // Khai báo ngoài để free sau này
+        struct curl_slist *headers = NULL; 
 
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
@@ -93,23 +81,20 @@ static void firebaseRequest(std::string path, std::string method, std::string da
             curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         }
 
-        std::string dummy; // Hứng response để không in ra stdout
+        std::string dummy; 
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &dummy);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
         
         CURLcode res = curl_easy_perform(curl);
-        if(res != CURLE_OK) {
-            printf("[Net] %s Failed: %s\n", method.c_str(), curl_easy_strerror(res));
-        }
+        if(res != CURLE_OK) printf("[Net] %s Failed: %s\n", method.c_str(), curl_easy_strerror(res));
 
-        // [QUAN TRỌNG] Giải phóng bộ nhớ headers để tránh leak RAM
         if (headers) curl_slist_free_all(headers);
         curl_easy_cleanup(curl);
     }
 }
 
-// --- CORE FUNCTIONS ---
+// --- CORE FUNCTIONS (UPDATED FOR MULTI-EMBEDDINGS) ---
 
 void Network_RewriteStore(const std::vector<UserInfo>& users) {
     std::ofstream ofs(LOCAL_DB_FILE, std::ios::binary | std::ios::trunc);
@@ -121,12 +106,15 @@ void Network_RewriteStore(const std::vector<UserInfo>& users) {
         strncpy(record.id, u.id.c_str(), 63);
         strncpy(record.name, u.name.c_str(), 63);
         
-        record.embedding_size = (int)u.embedding.size();
-        if (record.embedding_size > 1024) record.embedding_size = 1024; // Limit check
-        
-        if (record.embedding_size > 0) {
-            std::copy(u.embedding.begin(), u.embedding.begin() + record.embedding_size, record.embedding);
+        // Flatten: Gộp tất cả các vector con thành 1 mảng lớn
+        int offset = 0;
+        for(const auto& vec : u.embeddings) {
+            if (offset + vec.size() <= 1024) {
+                std::copy(vec.begin(), vec.end(), record.embedding + offset);
+                offset += vec.size();
+            }
         }
+        record.total_floats = offset;
 
         xor_crypt((char*)&record, sizeof(UserDiskRecord));
         ofs.write((char*)&record, sizeof(UserDiskRecord));
@@ -147,10 +135,23 @@ std::vector<UserInfo> Network_LoadDatabase() {
         u.id = std::string(record.id);
         u.name = std::string(record.name);
         
-        int size = record.embedding_size;
-        if (size <= 0 || size > 1024) size = 128; // Fallback an toàn
-        
-        u.embedding.assign(record.embedding, record.embedding + size);
+        // Un-Flatten: Cắt mảng lớn ra thành các vector 128 float
+        u.embeddings.clear();
+        int idx = 0;
+        while (idx + EMBEDDING_VECTOR_LEN <= record.total_floats) {
+            std::vector<float> vec;
+            vec.assign(record.embedding + idx, record.embedding + idx + EMBEDDING_VECTOR_LEN);
+            u.embeddings.push_back(vec);
+            idx += EMBEDDING_VECTOR_LEN;
+        }
+
+        // Tương thích ngược: Nếu load file cũ (embedding đơn), coi như 1 vector
+        if (u.embeddings.empty() && record.total_floats > 0) {
+             std::vector<float> vec;
+             vec.assign(record.embedding, record.embedding + record.total_floats);
+             u.embeddings.push_back(vec);
+        }
+
         users.push_back(u);
     }
     ifs.close();
@@ -159,13 +160,19 @@ std::vector<UserInfo> Network_LoadDatabase() {
 
 bool Network_SaveUser(const UserInfo& u) {
     // 1. Lưu vào thẻ nhớ (Local)
-    if (u.embedding.size() > 1024) return false; 
     UserDiskRecord record;
     memset(&record, 0, sizeof(UserDiskRecord));
     strncpy(record.id, u.id.c_str(), 63);
     strncpy(record.name, u.name.c_str(), 63);
-    record.embedding_size = (int)u.embedding.size();
-    std::copy(u.embedding.begin(), u.embedding.end(), record.embedding);
+    
+    int offset = 0;
+    for(const auto& vec : u.embeddings) {
+        if (offset + vec.size() <= 1024) {
+            std::copy(vec.begin(), vec.end(), record.embedding + offset);
+            offset += vec.size();
+        }
+    }
+    record.total_floats = offset;
     
     xor_crypt((char*)&record, sizeof(UserDiskRecord)); 
     std::ofstream ofs(LOCAL_DB_FILE, std::ios::binary | std::ios::app);
@@ -173,17 +180,13 @@ bool Network_SaveUser(const UserInfo& u) {
     ofs.write((char*)&record, sizeof(UserDiskRecord));
     ofs.close();
     
-    // 2. Đẩy lên Firebase (Cloud)
-    // Lưu ý: Đẩy vào node "/users" thay vì tách biệt metadata
+    // 2. Đẩy lên Firebase (Chỉ info, ko đẩy embedding để tiết kiệm)
     json j;
     j[u.id] = { 
         {"name", u.name}, 
         {"created_at", time(nullptr)}
-        // Bỏ comment dòng dưới nếu muốn đẩy cả vector mặt lên cloud (nặng data hơn)
-        // , {"embedding", u.embedding} 
     };
     
-    // Dùng PATCH để update node users mà không xóa người khác
     printf("[Net] Uploading user info for ID: %s\n", u.id.c_str());
     firebaseRequest("/users.json", "PATCH", j.dump());
     
@@ -191,19 +194,13 @@ bool Network_SaveUser(const UserInfo& u) {
 }
 
 bool Network_SyncFromCloud(std::vector<UserInfo>& local_users) {
-    // [FIX] Đường dẫn phải trùng với nơi SaveUser đẩy lên ("/users.json")
     std::string jsonStr = firebaseGet("/users.json");
-    
     if (jsonStr.empty() || jsonStr == "null") return false;
 
     bool isChanged = false;
     try {
         json j = json::parse(jsonStr);
         std::vector<UserInfo> new_list;
-        
-        // Logic: Duyệt qua danh sách người dùng LOCAL
-        // Nếu Server không có ID đó -> Xóa ở Local (Thu hồi quyền truy cập)
-        // Nếu Server có ID đó nhưng khác Tên -> Đổi tên ở Local
         
         for (auto& u : local_users) {
             if (j.contains(u.id)) {
@@ -215,7 +212,6 @@ bool Network_SyncFromCloud(std::vector<UserInfo>& local_users) {
                 }
                 new_list.push_back(u);
             } else {
-                // User có ở Local nhưng không có trên Cloud -> Đã bị xóa/Block
                 printf("[Sync] Access Revoked: %s (ID: %s)\n", u.name.c_str(), u.id.c_str());
                 isChanged = true;
             }
@@ -223,7 +219,7 @@ bool Network_SyncFromCloud(std::vector<UserInfo>& local_users) {
 
         if (isChanged) {
             local_users = new_list;
-            Network_RewriteStore(local_users); // Ghi đè lại file binary local
+            Network_RewriteStore(local_users); 
         }
 
     } catch (const std::exception& e) {
@@ -233,7 +229,6 @@ bool Network_SyncFromCloud(std::vector<UserInfo>& local_users) {
 }
 
 void Network_SendLog(const std::string& id, const std::string& name) {
-    // Debounce: Chỉ gửi log mỗi 30 giây cho cùng 1 người
     {
         std::lock_guard<std::mutex> lock(mtx_log);
         time_t now = time(nullptr);
@@ -249,7 +244,7 @@ void Network_SendLog(const std::string& id, const std::string& name) {
         {"id", id}, 
         {"name", name}, 
         {"timestamp", buf},
-        {"timestamp_unix", now} // Thêm timestamp dạng số để dễ sort trên App/Web
+        {"timestamp_unix", now}
     };
     
     printf("[Net] Sending Log: %s\n", name.c_str());
