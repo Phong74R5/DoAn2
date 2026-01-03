@@ -45,11 +45,17 @@
 #include "facenet.h"
 #include "network_helper.h"
 #include "wifi_helper.h"
+// ============================================================
+// COMMAND DEFINITIONS
+// ============================================================
 #define CMD_NONE        0
 #define CMD_SINGLE      1   // Short Press (Next)
-#define CMD_LONG        2   // Long Press > 0.8s (Select/Delete)
+#define CMD_LONG        2   // (Dự phòng - Không dùng trong Wifi mode này)
 #define CMD_SUPER_LONG  3   // Super Long > 3s (Connect)
-#define CMD_DOUBLE      4   // Double Click (Optional)
+#define CMD_DOUBLE      4   // Double Click
+// --- LỆNH MỚI CHO GIAO DIỆN 2 NÚT ---
+#define CMD_WIFI_SELECT 5   // Nút Sleep: Chọn ký tự (Select/Enter)
+#define CMD_SCROLL      6   // Nút Reg (Giữ): Cuộn nhanh (Fast Scroll)
 
 // =============================================================
 // GLOBAL VARIABLES & SHARED DATA
@@ -68,7 +74,7 @@ const std::vector<std::string> REG_STEPS_MSG = {
 };
 
 // Thêm '<' để xóa ký tự sai
-const std::string CHAR_SET_WIFI = "abcdefghijklmnopqrstuvwxyz0123456789 ._@#<K";
+const std::string CHAR_SET_WIFI = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ._@#<K";
 
 struct AIResult {
     std::vector<cv::Rect> faces;
@@ -121,6 +127,65 @@ void draw_corner_rect(cv::Mat& img, cv::Rect r, cv::Scalar color, int length, in
     cv::line(img, cv::Point(r.x + r.width, r.y + r.height), cv::Point(r.x + r.width - length, r.y + r.height), color, thickness);
     cv::line(img, cv::Point(r.x + r.width, r.y + r.height), cv::Point(r.x + r.width, r.y + r.height - length), color, thickness);
 }
+void draw_sleep_aod(cv::Mat& frame, bool is_online) {
+    // 1. Tạo nền đen
+    frame = cv::Mat::zeros(LCD_HEIGHT, LCD_WIDTH, CV_8UC3);
+
+    // 2. Lấy giờ hiện tại
+    time_t now = time(nullptr);
+    struct tm tstruct;
+    char time_buf[6];
+    tstruct = *localtime(&now);
+    strftime(time_buf, sizeof(time_buf), "%H:%M", &tstruct);
+
+    // 3. Các thông số chung
+    int center_x = LCD_WIDTH / 2;  // Tim màn hình (thường là 160)
+    int center_y = LCD_HEIGHT / 2; // Tim màn hình (thường là 120)
+    int baseline = 0;
+
+    // ---------------------------------------------------------
+    // VẼ GIỜ (TIME) - CĂN GIỮA
+    // ---------------------------------------------------------
+    double timeScale = 2.5; 
+    int timeThick = 3;
+    
+    // Đo kích thước thật của chữ giờ
+    cv::Size timeSize = cv::getTextSize(time_buf, cv::FONT_HERSHEY_SIMPLEX, timeScale, timeThick, &baseline);
+    
+    // Tính toán tọa độ X để chữ nằm giữa
+    int timeX = (LCD_WIDTH - timeSize.width) / 2;
+    // Tọa độ Y: Đặt cao hơn tâm một chút để nhường chỗ cho phần bên dưới
+    int timeY = center_y + 10; 
+
+    cv::putText(frame, time_buf, cv::Point(timeX, timeY), 
+                cv::FONT_HERSHEY_SIMPLEX, timeScale, cv::Scalar(90, 90, 90), timeThick);
+
+    // ---------------------------------------------------------
+    // VẼ CHẤM TRẠNG THÁI (DOT) - CĂN GIỮA
+    // ---------------------------------------------------------
+    cv::Scalar net_color = is_online ? cv::Scalar(0, 150, 0) : cv::Scalar(150, 0, 0);
+    int dotY = timeY + 25; // Nằm dưới giờ 25 pixel
+    
+    // Vẽ ngay tại trục giữa (center_x)
+    cv::circle(frame, cv::Point(center_x, dotY), 6, net_color, -1);
+
+    // ---------------------------------------------------------
+    // VẼ CHỮ "SLEEP MODE" - CĂN GIỮA
+    // ---------------------------------------------------------
+    std::string label = "SLEEP MODE";
+    double labelScale = 0.55;
+    int labelThick = 1;
+
+    // Đo kích thước chữ
+    cv::Size labelSize = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, labelScale, labelThick, &baseline);
+    
+    // Tính X
+    int labelX = (LCD_WIDTH - labelSize.width) / 2;
+    int labelY = dotY + 25; // Nằm dưới chấm tròn 25 pixel
+
+    cv::putText(frame, label, cv::Point(labelX, labelY), 
+                cv::FONT_HERSHEY_SIMPLEX, labelScale, cv::Scalar(60, 60, 60), labelThick);
+}
 
 
 // Hàm tạo hiệu ứng Fading (Sáng dần/Tối dần)
@@ -163,131 +228,148 @@ void lcd_backlight_fade(int start_duty, int end_duty, int duration_ms) {
 // TASK IMPLEMENTATIONS
 // =============================================================
 void* task_btn_register(void* arg) {
+    // Cấu hình GPIO
     bcm2835_gpio_fsel(PIN_BTN_REG, BCM2835_GPIO_FSEL_INPT);
     bcm2835_gpio_set_pud(PIN_BTN_REG, BCM2835_GPIO_PUD_UP);
-    printf("[BTN_TASK] Started on P1_15\n");
+    printf("[BTN_REG] Started for NAVIGATION (Next/Scroll)\n");
 
     while (g_running) {
+        // Phát hiện nhấn nút (Active LOW)
         if (bcm2835_gpio_lev(PIN_BTN_REG) == LOW) {
             
-            // 1. Đo thời gian giữ nút (Hold Time)
-            int hold_ms = 0;
-            // Tăng giới hạn break lên để đo được Super Long (ví dụ max 6s)
-            while (bcm2835_gpio_lev(PIN_BTN_REG) == LOW && g_running) {
-                bcm2835_delay(10); 
-                hold_ms += 10;
-                
-                // (Optional) Feedback LED nhấp nháy tại đây nếu muốn báo hiệu đã đủ 3s
-                if (hold_ms > 6000) break; // Timeout an toàn
-            }
+            // Chờ 200ms để phân biệt Nhấn nhả (Click) hay Nhấn giữ (Hold)
+            bcm2835_delay(200);
 
-            int action = CMD_NONE;
-
-            // 2. Phân loại hành động dựa trên thời gian
-            
-            // --- TRẠNG THÁI MỚI: SUPER LONG (> 3000ms) ---
-            if (hold_ms >= 3000) {
-                action = CMD_SUPER_LONG; // Lệnh số 3: Connect
-                printf("[BTN] Detected SUPER LONG PRESS (%d ms)\n", hold_ms);
-            }
-            // --- TRẠNG THÁI CŨ: LONG (> 800ms) ---
-            else if (hold_ms > 800) {
-                action = CMD_LONG;       // Lệnh số 2: Select/Add/Delete
-            } 
-            // --- TRẠNG THÁI CŨ: SHORT/DOUBLE ---
-            else if (hold_ms > 50) {
-                // Logic check Double Click giữ nguyên như cũ
-                int wait_double = 0;
-                bool is_double = false;
-                
-                while (wait_double < 250) {
-                    bcm2835_delay(10);
-                    wait_double += 10;
-                    if (bcm2835_gpio_lev(PIN_BTN_REG) == LOW) {
-                        is_double = true;
-                        while (bcm2835_gpio_lev(PIN_BTN_REG) == LOW) bcm2835_delay(10);
-                        break;
-                    }
-                }
-                
-                if (is_double) action = CMD_DOUBLE; // Lệnh số 4 (nếu dùng)
-                else action = CMD_SINGLE;           // Lệnh số 1: Next/Change
-            }
-
-            // 3. Xử lý Output
-            if (action != CMD_NONE) {
+            if (bcm2835_gpio_lev(PIN_BTN_REG) == HIGH) {
+                // ------------------------------------------------
+                // TRƯỜNG HỢP 1: NHẤN NHẢ (SHORT CLICK) -> NEXT
+                // ------------------------------------------------
                 if (g_wifi_mode_active) {
-                    // Gửi lệnh sang Wifi Task
-                    // action sẽ là 1, 2, hoặc 3 tương ứng với logic UI
-                    g_btn_cmd = action; 
-                    printf("[BTN] Wifi CMD: %d\n", action);
+                    g_btn_cmd = CMD_SINGLE; // Di chuyển 1 bước
+                    // printf("[BTN] Next char\n");
                 } 
                 else {
-                    // Logic cũ cho chế độ AI (Register Mode)
-                    // Bạn có thể tận dụng CMD_SUPER_LONG để làm tính năng Reset/Reboot nếu muốn
-                    if (action == CMD_SINGLE || action == CMD_LONG) {
-                        g_register_mode = !g_register_mode;
-                        printf("[BTN] Toggle Register Mode: %s\n", g_register_mode ? "ON" : "OFF");
+                    // Logic cũ khi không ở chế độ Wifi (Toggle Register Mode)
+                    g_register_mode = !g_register_mode;
+                    printf("[BTN] Register Mode: %s\n", g_register_mode ? "ON" : "OFF");
+                }
+            } 
+            else {
+                // ------------------------------------------------
+                // TRƯỜNG HỢP 2: NHẤN GIỮ (HOLD) -> FAST SCROLL
+                // ------------------------------------------------
+                while (bcm2835_gpio_lev(PIN_BTN_REG) == LOW && g_running) {
+                    if (g_wifi_mode_active) {
+                        g_btn_cmd = CMD_SCROLL; // Gửi lệnh cuộn liên tục
+                        bcm2835_delay(150);     // Tốc độ cuộn: 150ms/ký tự (Chỉnh số này để nhanh/chậm)
+                    } else {
+                        // Nếu không phải Wifi mode, không làm gì hoặc chờ nhả
+                        bcm2835_delay(100);
                     }
                 }
             }
             
-            bcm2835_delay(200); // Debounce sau khi nhả nút
+            bcm2835_delay(200); // Debounce sau khi thả nút
         }
-        bcm2835_delay(50); 
+        bcm2835_delay(20); // Polling delay
     }
     return NULL;
 }
 void* task_btn_power(void* arg) {
+    // Cấu hình GPIO
     bcm2835_gpio_fsel(PIN_BTN_SLEEP, BCM2835_GPIO_FSEL_INPT);
     bcm2835_gpio_set_pud(PIN_BTN_SLEEP, BCM2835_GPIO_PUD_UP);
     
-    // Đảm bảo đèn nền sáng lúc khởi động
+    // Bật đèn nền lúc khởi động
     bcm2835_gpio_write(PIN_LED, HIGH); 
-    
+    printf("[BTN_PWR] Started: Single(Sleep/Select) | Double(Reset/Rescan) | Hold(Shutdown/Connect)\n");
+
     while (g_running) {
         if (bcm2835_gpio_lev(PIN_BTN_SLEEP) == LOW) {
+            
+            // ---------------------------------------------------------
+            // BƯỚC 1: ĐO THỜI GIAN NHẤN LẦN 1
+            // ---------------------------------------------------------
             int hold_time = 0;
-            // Đếm thời gian giữ nút
-            while (bcm2835_gpio_lev(PIN_BTN_SLEEP) == LOW && hold_time < 3000) {
-                bcm2835_delay(100); 
-                hold_time += 100;
+            while (bcm2835_gpio_lev(PIN_BTN_SLEEP) == LOW) {
+                bcm2835_delay(10);
+                hold_time += 10;
+                // Nếu giữ quá lâu (>3s) thì break luôn để xử lý Shutdown/Connect ngay
+                if (hold_time >= 3000) break;
             }
 
-            // --- TRƯỜNG HỢP 1: SHUTDOWN (Giữ > 3s) ---
+            // ---------------------------------------------------------
+            // BƯỚC 2: PHÂN LOẠI HÀNH ĐỘNG
+            // ---------------------------------------------------------
+            
+            // === CASE 1: LONG PRESS (> 3000ms) ===
             if (hold_time >= 3000) {
-                Log("PWR", "Shutdown Sequence Initiated...");
-                
-                { 
-                    std::lock_guard<std::mutex> lock(mtx_ai); 
-                    shared_result.message = "SHUTTING DOWN..."; 
-                    shared_result.has_detection = false;
-                }
-                
-                // Hiệu ứng tắt màn hình từ từ khi shutdown (trong 1 giây)
-                lcd_backlight_fade(100, 0, 1000);
-                
-                bcm2835_delay(500); 
-                g_running = false; 
-                system("sudo poweroff");
-            } 
-            // --- TRƯỜNG HỢP 2: SLEEP / WAKE UP (Nhấn ngắn) ---
-            else if (hold_time > 50) {
-                g_is_sleeping = !g_is_sleeping;
-                Log("PWR", "Sleep Mode: %s", g_is_sleeping ? "ON" : "OFF");
-                
-                if (g_is_sleeping) {
-                    // ĐANG THỨC -> NGỦ: Tối dần từ 100% xuống 0% trong 500ms
-                    lcd_backlight_fade(100, 0, 500);
+                // Đợi nhả nút để tránh lặp lệnh
+                while(bcm2835_gpio_lev(PIN_BTN_SLEEP) == LOW) bcm2835_delay(50);
+
+                if (g_wifi_mode_active) {
+                    printf("[BTN] SUPER LONG -> CONNECT COMMAND!\n");
+                    g_btn_cmd = CMD_SUPER_LONG; 
                 } else {
-                    // ĐANG NGỦ -> THỨC: Sáng dần từ 0% lên 100% trong 500ms
-                    lcd_backlight_fade(0, 100, 500);
+                    printf("[PWR] SHUTDOWN TRIGGERED...\n");
+                    { std::lock_guard<std::mutex> lock(mtx_ai); shared_result.message = "SHUTTING DOWN..."; }
+                    lcd_backlight_fade(100, 0, 1000);
+                    g_running = false; 
+                    system("sudo poweroff");
                 }
             }
-            
-            bcm2835_delay(300); 
+            // === CASE 2: SHORT PRESS (< 3000ms) -> CHECK DOUBLE CLICK ===
+            else if (hold_time > 50) {
+                
+                // Mẹo: Chờ 250ms xem có cú nhấn thứ 2 không?
+                int wait_double = 0;
+                bool is_double_click = false;
+
+                while (wait_double < 250) {
+                    bcm2835_delay(10);
+                    wait_double += 10;
+                    // Nếu phát hiện nhấn lần nữa trong khoảng thời gian chờ
+                    if (bcm2835_gpio_lev(PIN_BTN_SLEEP) == LOW) {
+                        is_double_click = true;
+                        // Chờ nhả nút lần 2
+                        while(bcm2835_gpio_lev(PIN_BTN_SLEEP) == LOW) bcm2835_delay(10);
+                        break;
+                    }
+                }
+
+                if (is_double_click) {
+                    // >>> XỬ LÝ DOUBLE CLICK TẠI ĐÂY <<<
+                    printf("[PWR] DOUBLE CLICK DETECTED!\n");
+                    
+                    if (g_wifi_mode_active) {
+                        // Trong chế độ Wifi: Double click để Rescan hoặc Back
+                        g_btn_cmd = CMD_DOUBLE; 
+                    } else {
+                        // Trong chế độ thường: Double click để Reboot (Ví dụ)
+                        printf("[PWR] Rebooting system...\n");
+                        { std::lock_guard<std::mutex> lock(mtx_ai); shared_result.message = "REBOOTING..."; }
+                         lcd_backlight_fade(100, 0, 500);
+                        system("sudo reboot");
+                    }
+                } 
+                else {
+                    // >>> XỬ LÝ SINGLE CLICK TẠI ĐÂY <<<
+                    if (g_wifi_mode_active) {
+                        printf("[BTN] CLICK -> SELECT CHAR\n");
+                        g_btn_cmd = CMD_WIFI_SELECT;
+                    } else {
+                        // Sleep / Wake
+                        g_is_sleeping = !g_is_sleeping;
+                        printf("[PWR] Sleep Mode: %s\n", g_is_sleeping ? "ON" : "OFF");
+                        if (g_is_sleeping) lcd_backlight_fade(100, 15, 500);
+                        else lcd_backlight_fade(15, 100, 500);
+                    }
+                }
+            }
+
+            bcm2835_delay(300); // Debounce an toàn sau cùng
         }
-        bcm2835_delay(50); 
+        bcm2835_delay(20); // Polling nhanh hơn chút để bắt click nhạy hơn
     }
     return NULL;
 }
@@ -583,16 +665,10 @@ void* task_lcd(void* arg) {
 
         // --- CASE B: SLEEP MODE ---
         if (g_is_sleeping) {
-            // Vẽ lớp phủ tối màu (Dimming)
-            cv::putText(display_frame, "Zzz... SLEEPING", cv::Point(50, LCD_HEIGHT - 30), 
-                        cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 255), 2);
-            cv::Mat overlay = display_frame.clone();
-            overlay = cv::Scalar(0, 0, 0);
-            cv::addWeighted(display_frame, 0.4, overlay, 1, 0, display_frame);
-
-            send_mat_to_lcd(display_frame, spi_buffer);
-            usleep(200000); // Refresh chậm (5 FPS) để tiết kiệm CPU
-            continue;
+          draw_sleep_aod(display_frame, g_is_online);
+          send_mat_to_lcd(display_frame, spi_buffer);
+          sleep(1);   // 1 FPS – tiết kiệm CPU
+          continue;
         }
 
         // --- CASE C: NORMAL CAMERA MODE ---
@@ -659,6 +735,13 @@ void* task_sync(void* arg) {
 
 void* task_config_wifi(void* arg) {
     Log("WIFI", "Entering Config Mode...");
+    
+    if (g_is_sleeping) {
+        Log("WIFI", "System is sleeping -> Force WAKE UP for Config!");
+        g_is_sleeping = !g_is_sleeping;
+        lcd_backlight_fade(15, 100, 500);
+    }
+    
     g_wifi_mode_active = true; // Báo cho hệ thống biết đang ở Mode Config
     
     // Reset các biến trạng thái
@@ -672,130 +755,120 @@ void* task_config_wifi(void* arg) {
     std::string password = "";
     bool finished = false;
 
-    // Biến đếm để không check mạng quá liên tục (gây lag màn hình)
+    // Biến đếm để không check mạng quá liên tục
     int auto_check_counter = 0;
 
     while (!finished && g_running) {
         
         // ============================================================
-        // [QUAN TRỌNG] LOGIC TỰ THOÁT NẾU ĐÃ CÓ MẠNG (AUTO EXIT)
+        // LOGIC TỰ THOÁT NẾU ĐÃ CÓ MẠNG (AUTO EXIT)
         // ============================================================
         auto_check_counter++;
-        
-        // Cứ mỗi 40 vòng lặp (khoảng 2 giây) thì check mạng một lần
-        // Không check liên tục vì lệnh ping sẽ làm khựng màn hình
         if (auto_check_counter > 40) {
             auto_check_counter = 0;
-            
-            // Bước 1: Check xem có IP chưa (nhanh)
             if (Wifi_IsConnected()) {
-                // Bước 2: Check xem có Internet thật không (chậm hơn chút)
                 if (Network_CheckInternet()) {
                     Log("WIFI", "Detected Internet! Auto-exiting...");
-                    
-                    // Hiển thị thông báo nhanh
                     cv::Mat ui = cv::Mat::zeros(LCD_HEIGHT, LCD_WIDTH, CV_8UC3);
                     cv::putText(ui, "AUTO RECONNECTED!", cv::Point(30, 120), 1, 1.0, cv::Scalar(0, 255, 0), 2);
                     queue_push(&q_display, ui.clone());
-                    sleep(2); // Dừng 2s cho người dùng đọc
-                    
-                    finished = true; // <--- CỜ LỆNH THOÁT VÒNG LẶP
-                    continue;        // Bỏ qua phần vẽ UI bên dưới
+                    sleep(2);
+                    finished = true;
+                    continue; 
                 }
             }
         }
-        // ============================================================
 
-        // --- PHẦN XỬ LÝ GIAO DIỆN (UI) CŨ ---
+        // ============================================================
+        // XỬ LÝ GIAO DIỆN & INPUT
+        // ============================================================
         cv::Mat ui = cv::Mat::zeros(LCD_HEIGHT, LCD_WIDTH, CV_8UC3);
-        int cmd = g_btn_cmd.exchange(0); 
+        int cmd = g_btn_cmd.exchange(0); // Lấy lệnh và reset về 0
+
+        // Xử lý Double Click để Rescan (nếu cần)
         if (cmd == CMD_DOUBLE) {
-                    state = SCAN;
-                    char_idx = 0;
-                    cursor = 0;
-                    password = "";
-                    Log("WIFI", "Double click detected -> Force Re-SCAN");
-                }
+            state = SCAN;
+            char_idx = 0;
+            cursor = 0;
+            password = "";
+            Log("WIFI", "Double click -> Force Re-SCAN");
+        }
+
         switch (state) {
             case SCAN:
                 cv::putText(ui, "SCANNING...", cv::Point(80, 120), 1, 1.2, cv::Scalar(0, 255, 255), 2);
-                queue_push(&q_display, ui.clone()); // Đẩy ra màn hình ngay để đỡ đen
+                queue_push(&q_display, ui.clone()); 
                 networks = Wifi_Scan();
                 state = networks.empty() ? SCAN : SELECT;
                 break;
 
             case SELECT:
-                // ... (Code vẽ danh sách wifi cũ của bạn) ...
                 cv::putText(ui, "SELECT WIFI:", cv::Point(10, 30), 1, 1.0, cv::Scalar(0, 255, 0), 2);
                 for (int i=0; i<(int)networks.size() && i<5; i++) {
                     cv::Scalar col = (i==cursor) ? cv::Scalar(0,255,255) : cv::Scalar(150,150,150);
                     cv::putText(ui, (i==cursor?"> ":"  ") + networks[i].ssid, cv::Point(10, 70 + i*30), 1, 0.8, col, 1);
                 }
-                if (cmd == 1) cursor = (cursor + 1) % networks.size();
-                if (cmd == 2) { selected_ssid = networks[cursor].ssid; state = PASS; password = ""; }
+                
+                // Logic chọn Wifi: Nút REG di chuyển, Nút SLEEP chọn
+                if (cmd == CMD_SINGLE || cmd == CMD_SCROLL) cursor = (cursor + 1) % networks.size();
+                if (cmd == CMD_WIFI_SELECT) { selected_ssid = networks[cursor].ssid; state = PASS; password = ""; }
                 break;
             
             case PASS:
             {
                 // --- 1. DISPLAY UI ---
-                // Tiêu đề & Hướng dẫn
                 cv::putText(ui, "SSID: " + selected_ssid, cv::Point(10, 20), 1, 0.8, cv::Scalar(200,200,200), 1);
-                cv::putText(ui, "S:Change | L:Select", cv::Point(10, 210), 1, 0.6, cv::Scalar(100,100,100), 1);
+                
+                // [UPDATE UI] Hướng dẫn nút bấm mới
+                cv::putText(ui, "REG:Move | PWR:Select", cv::Point(10, 210), 1, 0.6, cv::Scalar(150,150,150), 1);
                 
                 // Ô nhập liệu
                 cv::rectangle(ui, cv::Rect(10, 30, 300, 35), cv::Scalar(50,50,50), -1);
                 cv::putText(ui, password, cv::Point(15, 58), 1, 1.2, cv::Scalar(255,255,255), 1);
             
-                // Hiển thị Ký tự đang chọn (Carousel)
-                // Tách riêng để xử lý hiển thị đặc biệt cho nút Backspace (<)
+                // Ký tự hiện tại (Carousel)
                 char currentChar = CHAR_SET_WIFI[char_idx];
                 std::string displayChar(1, currentChar);
-                cv::Scalar charColor = cv::Scalar(0, 255, 255); // Vàng mặc định
+                cv::Scalar charColor = cv::Scalar(0, 255, 255); 
             
                 if (currentChar == '<') {
-                    displayChar = "DEL"; // Hiển thị chữ DEL cho dễ hiểu thay vì dấu <
-                    charColor = cv::Scalar(0, 0, 255); // Màu đỏ cảnh báo
+                    displayChar = "DEL"; 
+                    charColor = cv::Scalar(0, 0, 255); 
                 }
             
-                // Vẽ ký tự to ở giữa
                 cv::putText(ui, "[" + displayChar + "]", cv::Point(110, 140), 1, 3.0, charColor, 3);
             
-                // Hướng dẫn CONNECT (chỉ hiện khi đủ độ dài)
                 if (password.length() >= 8) {
-                    cv::putText(ui, "HOLD 3s TO CONNECT ->", cv::Point(20, 180), 1, 0.7, cv::Scalar(0,255,0), 2);
+                    cv::putText(ui, "HOLD PWR 3s TO CONNECT", cv::Point(20, 180), 1, 0.7, cv::Scalar(0,255,0), 2);
                 }
             
-                // --- 2. INPUT LOGIC ---
+                // --- 2. INPUT LOGIC (FIXED) ---
                 
-                // CMD 1: Short Press -> Đổi ký tự
-                if (cmd == 1) { 
+                // [FIX 1] DI CHUYỂN & CUỘN (Nút Register)
+                // Chấp nhận cả CMD_SINGLE (nhấn nhả) và CMD_SCROLL (nhấn giữ từ task_register mới)
+                if (cmd == CMD_SINGLE || cmd == CMD_SCROLL) { 
                     char_idx++; 
                     if(char_idx >= (int)CHAR_SET_WIFI.length()) char_idx = 0; 
                 }
                 
-                // CMD 2: Long Press -> Chọn hoặc Xóa
-                if (cmd == 2) { 
+                // [FIX 2] CHỌN / XÓA (Nút Sleep/Power nhấn ngắn)
+                // Thay thế CMD_LONG (2) cũ bằng CMD_WIFI_SELECT (5)
+                if (cmd == CMD_WIFI_SELECT) { 
                     if (currentChar == '<') {
-                        // Logic Backspace (Xóa ký tự cuối)
-                        if (!password.empty()) {
-                            password.pop_back();
-                        }
+                        if (!password.empty()) password.pop_back();
                     } else {
-                        // Logic Nhập ký tự thường
                         password += currentChar;
                     }
                     
-                    // UX TIP: KHÔNG reset char_idx=0. Giữ nguyên vị trí để nhập tiếp nhanh hơn.
-                    // Chỉ reset về 0 nếu bạn muốn, nhưng trải nghiệm sẽ tệ hơn.
+                    // Feedback visual: Nháy màu xanh một chút để báo đã chọn
+                    cv::circle(ui, cv::Point(280, 210), 8, cv::Scalar(0, 255, 0), -1);
                 }
                 
-                // CMD 3: Super Long Press -> Kết nối
-                // Lưu ý: Đảm bảo driver nút bấm của bạn không bắn cmd=2 trước khi bắn cmd=3
-                if (cmd == 3) {
+                // [FIX 3] KẾT NỐI (Nút Sleep/Power nhấn giữ > 3s)
+                if (cmd == CMD_SUPER_LONG) {
                     if (password.length() >= 8) {
                          state = CONNECTING;
                     } else {
-                         // Báo lỗi nếu chưa đủ ký tự mà cố connect
                          cv::putText(ui, "MIN 8 CHARS!", cv::Point(160, 180), 1, 0.7, cv::Scalar(0,0,255), 2);
                     }
                 }
@@ -814,7 +887,7 @@ void* task_config_wifi(void* arg) {
                 cv::putText(ui, "CONNECTED!", cv::Point(50, 120), 1, 1.2, cv::Scalar(0, 255, 0), 2);
                 queue_push(&q_display, ui.clone());
                 sleep(2);
-                finished = true; // <--- Thoát khi kết nối thủ công thành công
+                finished = true; 
                 break;
 
             case FAIL:
@@ -827,11 +900,11 @@ void* task_config_wifi(void* arg) {
 
         if (!finished) {
             queue_push(&q_display, ui.clone());
-            usleep(50000); // 50ms delay
+            usleep(50000); 
         }
     }
 
-    g_wifi_mode_active = false; // Tắt cờ Config -> Camera sẽ hoạt động lại
+    g_wifi_mode_active = false; 
     return NULL;
 }
 void* task_network_monitor(void* arg) {
@@ -840,7 +913,7 @@ void* task_network_monitor(void* arg) {
     sleep(5); 
 
     while (g_running) {
-        if (!g_wifi_mode_active && !g_is_sleeping) {
+        if (!g_wifi_mode_active) {
             
             // Kiểm tra mạng
             bool has_internet = Network_CheckInternet();
