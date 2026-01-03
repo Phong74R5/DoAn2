@@ -2,7 +2,17 @@
 let attendanceData = [];
 let usersData = [];
 let currentEditId = null;
-let currentEditOldName = null;
+// let currentEditOldName = null; // Không cần dùng biến này nữa
+
+// Helper: Format timestamp unix -> Ngày giờ VN
+function formatDateTime(unixTimestamp) {
+    if (!unixTimestamp) return { date: '--', time: '--' };
+    const dateObj = new Date(unixTimestamp * 1000);
+    return {
+        date: dateObj.toLocaleDateString('vi-VN'),
+        time: dateObj.toLocaleTimeString('vi-VN')
+    };
+}
 
 // Tab switching
 function showTab(tabName) {
@@ -28,17 +38,15 @@ function loadAttendance() {
         if (data) {
             Object.keys(data).forEach(key => {
                 attendanceData.push({
-                    id: key,
-                    ...data[key]
+                    firebaseKey: key, // Lưu key để dùng nếu cần
+                    id: data[key].id,
+                    name: data[key].name,
+                    timestamp_unix: data[key].timestamp_unix // Lấy timestamp từ C++
                 });
             });
             
-            // Sort by date and time (newest first)
-            attendanceData.sort((a, b) => {
-                const dateA = new Date(a.date + ' ' + a.time);
-                const dateB = new Date(b.date + ' ' + b.time);
-                return dateB - dateA;
-            });
+            // Sắp xếp: Mới nhất lên đầu (dựa vào timestamp_unix)
+            attendanceData.sort((a, b) => (b.timestamp_unix || 0) - (a.timestamp_unix || 0));
         }
         
         displayAttendance();
@@ -55,20 +63,30 @@ function displayAttendance() {
         return;
     }
     
-    tbody.innerHTML = attendanceData.map(record => `
+    tbody.innerHTML = attendanceData.map(record => {
+        // Xử lý hiển thị ngày giờ tại đây
+        const dateTime = formatDateTime(record.timestamp_unix);
+        
+        return `
         <tr>
-            <td><strong>${record.name}</strong></td>
-            <td>${record.date}</td>
-            <td>${record.time}</td>
+            <td><strong>${escapeHtml(record.name)}</strong></td>
+            <td>${dateTime.date}</td>
+            <td>${dateTime.time}</td>
             <td><small style="color: #999;">${record.id}</small></td>
         </tr>
-    `).join('');
+    `}).join('');
 }
 
 // Update Attendance Stats
 function updateAttendanceStats() {
-    const today = new Date().toISOString().split('T')[0];
-    const todayRecords = attendanceData.filter(r => r.date === today);
+    const now = new Date();
+    const todayStr = now.toLocaleDateString('vi-VN');
+    
+    // Đếm check-in hôm nay
+    const todayRecords = attendanceData.filter(r => {
+        const dt = formatDateTime(r.timestamp_unix);
+        return dt.date === todayStr;
+    });
     
     document.getElementById('todayCount').textContent = todayRecords.length;
     document.getElementById('totalAttendance').textContent = attendanceData.length;
@@ -77,11 +95,13 @@ function updateAttendanceStats() {
 // Filter Attendance
 function filterAttendance() {
     const searchTerm = document.getElementById('searchAttendance').value.toLowerCase();
-    const filtered = attendanceData.filter(record => 
-        record.name.toLowerCase().includes(searchTerm) ||
-        record.date.includes(searchTerm) ||
-        record.time.includes(searchTerm)
-    );
+    
+    const filtered = attendanceData.filter(record => {
+        const dt = formatDateTime(record.timestamp_unix);
+        return (record.name && record.name.toLowerCase().includes(searchTerm)) ||
+               (record.id && record.id.toLowerCase().includes(searchTerm)) ||
+               (dt.date.includes(searchTerm));
+    });
     
     const tbody = document.getElementById('attendanceBody');
     
@@ -90,14 +110,16 @@ function filterAttendance() {
         return;
     }
     
-    tbody.innerHTML = filtered.map(record => `
+    tbody.innerHTML = filtered.map(record => {
+        const dateTime = formatDateTime(record.timestamp_unix);
+        return `
         <tr>
-            <td><strong>${record.name}</strong></td>
-            <td>${record.date}</td>
-            <td>${record.time}</td>
+            <td><strong>${escapeHtml(record.name)}</strong></td>
+            <td>${dateTime.date}</td>
+            <td>${dateTime.time}</td>
             <td><small style="color: #999;">${record.id}</small></td>
         </tr>
-    `).join('');
+    `}).join('');
 }
 
 // ==================== USERS FUNCTIONS ====================
@@ -134,7 +156,7 @@ function displayUsers() {
     tbody.innerHTML = usersData.map(user => `
         <tr>
             <td><small style="color: #999;">${user.id}</small></td>
-            <td><strong>${user.name}</strong></td>
+            <td><strong>${escapeHtml(user.name)}</strong></td>
             <td>
                 <button class="action-btn edit-btn" onclick="openEditModal('${user.id}', '${escapeHtml(user.name)}')">✏️ Edit</button>
                 <button class="action-btn delete-btn" onclick="deleteUser('${user.id}', '${escapeHtml(user.name)}')">🗑️ Delete</button>
@@ -166,7 +188,7 @@ function filterUsers() {
     tbody.innerHTML = filtered.map(user => `
         <tr>
             <td><small style="color: #999;">${user.id}</small></td>
-            <td><strong>${user.name}</strong></td>
+            <td><strong>${escapeHtml(user.name)}</strong></td>
             <td>
                 <button class="action-btn edit-btn" onclick="openEditModal('${user.id}', '${escapeHtml(user.name)}')">✏️ Edit</button>
                 <button class="action-btn delete-btn" onclick="deleteUser('${user.id}', '${escapeHtml(user.name)}')">🗑️ Delete</button>
@@ -180,7 +202,7 @@ function filterUsers() {
 // Open Edit Modal
 function openEditModal(userId, userName) {
     currentEditId = userId;
-    currentEditOldName = userName;
+    // currentEditOldName = userName; // Không dùng nữa
     document.getElementById('editName').value = userName;
     document.getElementById('editModal').style.display = 'block';
 }
@@ -205,8 +227,8 @@ function saveEdit() {
     database.ref('users/' + currentEditId).update({
         name: newName
     }).then(() => {
-        // Update all attendance records with the old name to the new name
-        return updateAttendanceRecordsName(currentEditOldName, newName);
+        // FIX: Cập nhật attendance dựa trên ID chứ không dựa trên tên cũ
+        return updateAttendanceRecordsById(currentEditId, newName);
     }).then(() => {
         alert('✅ User name updated successfully in both Users and Attendance records!');
         closeModal();
@@ -215,15 +237,16 @@ function saveEdit() {
     });
 }
 
-// Update all attendance records that match the old name
-function updateAttendanceRecordsName(oldName, newName) {
+// FIX: Hàm mới để update dựa trên ID (Chính xác hơn)
+function updateAttendanceRecordsById(userId, newName) {
     return database.ref('attendance').once('value').then((snapshot) => {
         const updates = {};
         const data = snapshot.val();
         
         if (data) {
             Object.keys(data).forEach(key => {
-                if (data[key].name === oldName) {
+                // So sánh ID trong record attendance với userId đang sửa
+                if (data[key].id && String(data[key].id) === String(userId)) {
                     updates[`attendance/${key}/name`] = newName;
                 }
             });
@@ -255,6 +278,7 @@ function deleteUser(userId, userName) {
 
 // Escape HTML to prevent XSS
 function escapeHtml(text) {
+    if (!text) return "";
     const map = {
         '&': '&amp;',
         '<': '&lt;',
@@ -262,7 +286,7 @@ function escapeHtml(text) {
         '"': '&quot;',
         "'": '&#039;'
     };
-    return text.replace(/[&<>"']/g, m => map[m]);
+    return text.toString().replace(/[&<>"']/g, m => map[m]);
 }
 
 // Close modal when clicking outside
